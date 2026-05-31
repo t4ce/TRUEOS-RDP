@@ -102,6 +102,10 @@ pub enum InputEvent {
     ModifiersChanged {
         ctrl: bool,
     },
+    KeyboardInput {
+        hid_keycode: u8,
+        state: InputButtonState,
+    },
     EscapePressed,
 }
 
@@ -780,6 +784,9 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         }
 
         if let Some(input) = input_event(&event) {
+            self.producer.handle_input(input);
+        }
+        if let Some(input) = keyboard_input_event(&event) {
             self.producer.handle_input(input);
         }
 
@@ -2038,6 +2045,9 @@ fn handle_window_event<P: FrameProducer>(
     if let Some(input) = input_event(&event) {
         producer.handle_input(input);
     }
+    if let Some(input) = keyboard_input_event(&event) {
+        producer.handle_input(input);
+    }
 
     match event {
         WindowEvent::CloseRequested => event_loop.exit(),
@@ -2058,6 +2068,23 @@ fn handle_window_event<P: FrameProducer>(
         }
         _ => {}
     }
+}
+
+fn keyboard_input_event(event: &WindowEvent) -> Option<InputEvent> {
+    let WindowEvent::KeyboardInput { event, .. } = event else {
+        return None;
+    };
+    let hid_keycode = match event.physical_key {
+        PhysicalKey::Code(code) => key_code_to_hid(code),
+        _ => 0,
+    };
+    if hid_keycode == 0 {
+        return None;
+    }
+    Some(InputEvent::KeyboardInput {
+        hid_keycode,
+        state: button_state(event.state),
+    })
 }
 
 fn input_event(event: &WindowEvent) -> Option<InputEvent> {
@@ -2104,6 +2131,95 @@ fn input_event(event: &WindowEvent) -> Option<InputEvent> {
             }
         }
         _ => None,
+    }
+}
+
+fn key_code_to_hid(code: KeyCode) -> u8 {
+    match code {
+        KeyCode::KeyA => 0x04,
+        KeyCode::KeyB => 0x05,
+        KeyCode::KeyC => 0x06,
+        KeyCode::KeyD => 0x07,
+        KeyCode::KeyE => 0x08,
+        KeyCode::KeyF => 0x09,
+        KeyCode::KeyG => 0x0A,
+        KeyCode::KeyH => 0x0B,
+        KeyCode::KeyI => 0x0C,
+        KeyCode::KeyJ => 0x0D,
+        KeyCode::KeyK => 0x0E,
+        KeyCode::KeyL => 0x0F,
+        KeyCode::KeyM => 0x10,
+        KeyCode::KeyN => 0x11,
+        KeyCode::KeyO => 0x12,
+        KeyCode::KeyP => 0x13,
+        KeyCode::KeyQ => 0x14,
+        KeyCode::KeyR => 0x15,
+        KeyCode::KeyS => 0x16,
+        KeyCode::KeyT => 0x17,
+        KeyCode::KeyU => 0x18,
+        KeyCode::KeyV => 0x19,
+        KeyCode::KeyW => 0x1A,
+        KeyCode::KeyX => 0x1B,
+        KeyCode::KeyY => 0x1C,
+        KeyCode::KeyZ => 0x1D,
+        KeyCode::Digit1 => 0x1E,
+        KeyCode::Digit2 => 0x1F,
+        KeyCode::Digit3 => 0x20,
+        KeyCode::Digit4 => 0x21,
+        KeyCode::Digit5 => 0x22,
+        KeyCode::Digit6 => 0x23,
+        KeyCode::Digit7 => 0x24,
+        KeyCode::Digit8 => 0x25,
+        KeyCode::Digit9 => 0x26,
+        KeyCode::Digit0 => 0x27,
+        KeyCode::Enter => 0x28,
+        KeyCode::Escape => 0x29,
+        KeyCode::Backspace => 0x2A,
+        KeyCode::Tab => 0x2B,
+        KeyCode::Space => 0x2C,
+        KeyCode::Minus => 0x2D,
+        KeyCode::Equal => 0x2E,
+        KeyCode::BracketLeft => 0x2F,
+        KeyCode::BracketRight => 0x30,
+        KeyCode::Backslash => 0x31,
+        KeyCode::Semicolon => 0x33,
+        KeyCode::Quote => 0x34,
+        KeyCode::Backquote => 0x35,
+        KeyCode::Comma => 0x36,
+        KeyCode::Period => 0x37,
+        KeyCode::Slash => 0x38,
+        KeyCode::CapsLock => 0x39,
+        KeyCode::F1 => 0x3A,
+        KeyCode::F2 => 0x3B,
+        KeyCode::F3 => 0x3C,
+        KeyCode::F4 => 0x3D,
+        KeyCode::F5 => 0x3E,
+        KeyCode::F6 => 0x3F,
+        KeyCode::F7 => 0x40,
+        KeyCode::F8 => 0x41,
+        KeyCode::F9 => 0x42,
+        KeyCode::F10 => 0x43,
+        KeyCode::F11 => 0x44,
+        KeyCode::F12 => 0x45,
+        KeyCode::Insert => 0x49,
+        KeyCode::Home => 0x4A,
+        KeyCode::PageUp => 0x4B,
+        KeyCode::Delete => 0x4C,
+        KeyCode::End => 0x4D,
+        KeyCode::PageDown => 0x4E,
+        KeyCode::ArrowRight => 0x4F,
+        KeyCode::ArrowLeft => 0x50,
+        KeyCode::ArrowDown => 0x51,
+        KeyCode::ArrowUp => 0x52,
+        KeyCode::ControlLeft => 0xE0,
+        KeyCode::ShiftLeft => 0xE1,
+        KeyCode::AltLeft => 0xE2,
+        KeyCode::SuperLeft => 0xE3,
+        KeyCode::ControlRight => 0xE4,
+        KeyCode::ShiftRight => 0xE5,
+        KeyCode::AltRight => 0xE6,
+        KeyCode::SuperRight => 0xE7,
+        _ => 0,
     }
 }
 

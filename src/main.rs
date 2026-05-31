@@ -105,6 +105,7 @@ const MSG_DRAW_TEX_TRIANGLES: u16 = 16;
 const MSG_RESOURCE_SNAPSHOT_BEGIN: u16 = 17;
 const MSG_RESOURCE_SNAPSHOT_END: u16 = 18;
 const MSG_INPUT_TABLET_ABS: u16 = 100;
+const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const INPUT_FLAG_MOTION: u32 = 1 << 0;
 const INPUT_FLAG_WHEEL: u32 = 1 << 1;
 const INPUT_FLAG_BUTTONS: u32 = 1 << 2;
@@ -193,12 +194,24 @@ enum RdpMessage {
 }
 
 #[derive(Clone, Copy, Debug)]
-struct RdpInput {
+enum RdpInput {
+    Tablet(RdpTabletInput),
+    Keyboard(RdpKeyboardInput),
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RdpTabletInput {
     slot_id: u32,
     x_q16: u32,
     y_q16: u32,
     buttons_down: u32,
     flags: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RdpKeyboardInput {
+    modifiers: u8,
+    keys: [u8; 6],
 }
 
 struct RdpViewer {
@@ -221,6 +234,8 @@ struct RdpViewer {
     cursor_x: f32,
     cursor_y: f32,
     buttons_down: u32,
+    keyboard_modifiers: u8,
+    keyboard_keys: [u8; 6],
 }
 
 impl RdpViewer {
@@ -245,6 +260,8 @@ impl RdpViewer {
             cursor_x: 0.0,
             cursor_y: 0.0,
             buttons_down: 0,
+            keyboard_modifiers: 0,
+            keyboard_keys: [0; 6],
         }
     }
 
@@ -530,13 +547,54 @@ impl RdpViewer {
     fn emit_input(&self, flags: u32) {
         let x_q16 = norm_to_q16(self.cursor_x / self.local_width.max(1) as f32);
         let y_q16 = norm_to_q16(self.cursor_y / self.local_height.max(1) as f32);
-        let _ = self.input_tx.send(RdpInput {
+        let _ = self.input_tx.send(RdpInput::Tablet(RdpTabletInput {
             slot_id: 1,
             x_q16,
             y_q16,
             buttons_down: self.buttons_down,
             flags,
-        });
+        }));
+    }
+
+    fn emit_keyboard_input(&self) {
+        let _ = self.input_tx.send(RdpInput::Keyboard(RdpKeyboardInput {
+            modifiers: self.keyboard_modifiers,
+            keys: self.keyboard_keys,
+        }));
+    }
+
+    fn update_keyboard(&mut self, hid_keycode: u8, state: InputButtonState) {
+        if (0xE0..=0xE7).contains(&hid_keycode) {
+            let bit = 1u8 << (hid_keycode - 0xE0);
+            match state {
+                InputButtonState::Pressed => self.keyboard_modifiers |= bit,
+                InputButtonState::Released => self.keyboard_modifiers &= !bit,
+            }
+            self.emit_keyboard_input();
+            return;
+        }
+
+        if hid_keycode == 0 {
+            return;
+        }
+
+        match state {
+            InputButtonState::Pressed => {
+                if !self.keyboard_keys.iter().any(|key| *key == hid_keycode) {
+                    if let Some(slot) = self.keyboard_keys.iter_mut().find(|key| **key == 0) {
+                        *slot = hid_keycode;
+                    }
+                }
+            }
+            InputButtonState::Released => {
+                for key in &mut self.keyboard_keys {
+                    if *key == hid_keycode {
+                        *key = 0;
+                    }
+                }
+            }
+        }
+        self.emit_keyboard_input();
     }
 }
 
@@ -562,6 +620,9 @@ impl FrameProducer for RdpViewer {
                 self.emit_input(INPUT_FLAG_BUTTONS);
             }
             InputEvent::MouseWheel { .. } => self.emit_input(INPUT_FLAG_WHEEL),
+            InputEvent::KeyboardInput { hid_keycode, state } => {
+                self.update_keyboard(hid_keycode, state)
+            }
             _ => {}
         }
     }
@@ -770,6 +831,13 @@ fn drain_input(stream: &mut TcpStream, input_rx: &Receiver<RdpInput>) -> io::Res
 }
 
 fn encode_input_frame(input: RdpInput) -> Vec<u8> {
+    match input {
+        RdpInput::Tablet(input) => encode_tablet_input_frame(input),
+        RdpInput::Keyboard(input) => encode_keyboard_input_frame(input),
+    }
+}
+
+fn encode_tablet_input_frame(input: RdpTabletInput) -> Vec<u8> {
     let mut payload = Vec::with_capacity(8 + 20);
     payload.extend_from_slice(b"TRDP");
     payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
@@ -779,6 +847,29 @@ fn encode_input_frame(input: RdpInput) -> Vec<u8> {
     payload.extend_from_slice(&input.y_q16.to_le_bytes());
     payload.extend_from_slice(&input.buttons_down.to_le_bytes());
     payload.extend_from_slice(&input.flags.to_le_bytes());
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload.as_slice());
+    frame
+}
+
+fn encode_keyboard_input_frame(input: RdpKeyboardInput) -> Vec<u8> {
+    let keys_lo = u32::from_le_bytes([
+        input.keys[0],
+        input.keys[1],
+        input.keys[2],
+        input.keys[3],
+    ]);
+    let keys_hi = u32::from_le_bytes([input.keys[4], input.keys[5], 0, 0]);
+    let mut payload = Vec::with_capacity(8 + 16);
+    payload.extend_from_slice(b"TRDP");
+    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    payload.extend_from_slice(&MSG_INPUT_KEYBOARD_BOOT.to_le_bytes());
+    payload.extend_from_slice(&1u32.to_le_bytes());
+    payload.extend_from_slice(&(input.modifiers as u32).to_le_bytes());
+    payload.extend_from_slice(&keys_lo.to_le_bytes());
+    payload.extend_from_slice(&keys_hi.to_le_bytes());
 
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
