@@ -2,8 +2,8 @@ use std::env;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{
+    Arc, Mutex, OnceLock,
     mpsc::{self, Receiver, Sender},
-    OnceLock,
 };
 use std::thread;
 use std::time::Duration;
@@ -19,8 +19,9 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 const PROTOCOL_VERSION: u16 = 1;
-const DEFAULT_ADDR: &str = "127.0.0.1:100";
+const DEFAULT_ADDR: &str = "trueos.eu:100";
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
+const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const DETAILED_LOG_LIMIT: u64 = 16;
 
@@ -109,6 +110,8 @@ const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const INPUT_FLAG_MOTION: u32 = 1 << 0;
 const INPUT_FLAG_WHEEL: u32 = 1 << 1;
 const INPUT_FLAG_BUTTONS: u32 = 1 << 2;
+const LOGO_TEX_ID: u32 = 0xFFFF_FFFE;
+const LOGO_JPEG: &[u8] = include_bytes!("../logo.jpg");
 
 #[derive(Debug)]
 enum RdpEvent {
@@ -125,33 +128,45 @@ enum RdpMessage {
         caps: u32,
     },
     BeginFrame {
+        seq: u32,
         flags: u32,
         clear_rgb: u32,
     },
-    EndFrame,
+    EndFrame {
+        seq: u32,
+    },
     SetBlend {
+        seq: u32,
         enabled: u32,
         src_rgb: u32,
         dst_rgb: u32,
     },
     SetSampler {
+        seq: u32,
         wrap_s: u32,
         wrap_t: u32,
         min_filter: u32,
         mag_filter: u32,
     },
     SetScissor {
+        seq: u32,
         x: u32,
         y: u32,
         width: u32,
         height: u32,
     },
-    ClearScissor,
+    ClearScissor {
+        seq: u32,
+    },
     SetRenderTarget {
+        seq: u32,
         tex_id: u32,
     },
-    ClearRenderTarget,
+    ClearRenderTarget {
+        seq: u32,
+    },
     ClearRect {
+        seq: u32,
         rgb: u32,
         x: u32,
         y: u32,
@@ -178,9 +193,11 @@ enum RdpMessage {
         bytes: usize,
     },
     DrawRgb {
+        seq: u32,
         bytes: Vec<u8>,
     },
     DrawTex {
+        seq: u32,
         tex_id: u32,
         sampler_flags: u32,
         sample_kind: TextureSampleKind,
@@ -217,9 +234,16 @@ struct RdpKeyboardInput {
 struct RdpViewer {
     rx: Receiver<RdpEvent>,
     input_tx: Sender<RdpInput>,
+    target: Arc<Mutex<String>>,
+    target_text: String,
     connected: bool,
     frame_active: bool,
+    active_frame_seq: u32,
     have_frame: bool,
+    asset_sync_active: bool,
+    asset_sync_ready: bool,
+    asset_sync_remaining: u32,
+    dropping_frame_depth: u32,
     frames: u64,
     pending_messages: u64,
     textures: u64,
@@ -236,16 +260,30 @@ struct RdpViewer {
     buttons_down: u32,
     keyboard_modifiers: u8,
     keyboard_keys: [u8; 6],
+    logo_texture_ready: bool,
+    logo_width: u32,
+    logo_height: u32,
 }
 
 impl RdpViewer {
-    fn new(rx: Receiver<RdpEvent>, input_tx: Sender<RdpInput>) -> Self {
+    fn new(rx: Receiver<RdpEvent>, input_tx: Sender<RdpInput>, target: Arc<Mutex<String>>) -> Self {
+        let target_text = target
+            .lock()
+            .map(|target| target.clone())
+            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
         Self {
             rx,
             input_tx,
+            target,
+            target_text,
             connected: false,
             frame_active: false,
+            active_frame_seq: 0,
             have_frame: false,
+            asset_sync_active: false,
+            asset_sync_ready: false,
+            asset_sync_remaining: 0,
+            dropping_frame_depth: 0,
             frames: 0,
             pending_messages: 0,
             textures: 0,
@@ -262,6 +300,9 @@ impl RdpViewer {
             buttons_down: 0,
             keyboard_modifiers: 0,
             keyboard_keys: [0; 6],
+            logo_texture_ready: false,
+            logo_width: 0,
+            logo_height: 0,
         }
     }
 
@@ -270,6 +311,13 @@ impl RdpViewer {
             RdpEvent::Connected => {
                 self.connected = true;
                 self.last_error = None;
+                self.frame_active = false;
+                self.active_frame_seq = 0;
+                self.have_frame = false;
+                self.asset_sync_active = false;
+                self.asset_sync_ready = false;
+                self.asset_sync_remaining = 0;
+                self.dropping_frame_depth = 0;
                 log_info!("connected");
             }
             RdpEvent::Disconnected(reason) => {
@@ -281,6 +329,61 @@ impl RdpViewer {
             }
             RdpEvent::Message(msg) => self.apply_message(adapter, msg),
         }
+    }
+
+    fn frame_seq_active(&self, seq: u32) -> bool {
+        self.frame_active && self.active_frame_seq == seq
+    }
+
+    fn note_asset_synced(&mut self) {
+        if self.asset_sync_active && self.asset_sync_remaining > 0 {
+            self.asset_sync_remaining -= 1;
+        }
+        if !self.asset_sync_active && self.asset_sync_remaining == 0 {
+            self.asset_sync_ready = true;
+        }
+    }
+
+    fn draw_logo(&mut self, adapter: &mut Adapter) {
+        if !self.logo_texture_ready {
+            match decode_jpeg_rgba(LOGO_JPEG) {
+                Ok((width, height, rgba)) => {
+                    if adapter.upload_texture_rgba_image(LOGO_TEX_ID, width, height, &rgba) == 0 {
+                        self.logo_width = width;
+                        self.logo_height = height;
+                        self.logo_texture_ready = true;
+                    }
+                }
+                Err(err) => {
+                    log_warn!("logo decode failed: {}", err);
+                    self.logo_texture_ready = true;
+                }
+            }
+        }
+
+        let bg = if self.connected { 0x102030 } else { 0x281820 };
+        let _ = adapter.begin_frame(bg);
+        if self.logo_texture_ready {
+            let vertices = logo_vertices(
+                self.logo_width,
+                self.logo_height,
+                self.local_width,
+                self.local_height,
+            );
+            let _ = adapter.set_sampler_raw(0, 0, 1, 1);
+            let _ = adapter.draw_tex_triangles_sample_kind_no_present(
+                LOGO_TEX_ID,
+                TextureSampleKind::Rgba,
+                &vertices,
+            );
+        }
+        draw_startup_field(
+            adapter,
+            self.local_width,
+            self.local_height,
+            &format!("cargo run -- {}", self.target_text),
+        );
+        let _ = adapter.end_frame();
     }
 
     fn apply_message(&mut self, adapter: &mut Adapter, msg: RdpMessage) {
@@ -299,11 +402,28 @@ impl RdpViewer {
                     caps
                 );
             }
-            RdpMessage::BeginFrame { flags, clear_rgb } => {
+            RdpMessage::BeginFrame {
+                seq,
+                flags,
+                clear_rgb,
+            } => {
+                if self.dropping_frame_depth > 0 {
+                    self.dropping_frame_depth = self.dropping_frame_depth.saturating_add(1);
+                    return;
+                }
+                if !self.asset_sync_ready {
+                    self.dropping_frame_depth = 1;
+                    return;
+                }
                 if self.frame_active {
-                    log_warn!("begin_frame while active; closing previous frame");
+                    log_warn!(
+                        "begin_frame seq={} while active seq={}; closing previous frame",
+                        seq,
+                        self.active_frame_seq
+                    );
                     let _ = adapter.end_frame();
                     self.frame_active = false;
+                    self.active_frame_seq = 0;
                 }
                 let preserve = (flags & 1) != 0;
                 let allow_present = (flags & 2) != 0;
@@ -315,17 +435,23 @@ impl RdpViewer {
                     adapter.begin_frame_no_present(clear_rgb)
                 };
                 self.frame_active = status == 0;
+                self.active_frame_seq = if status == 0 { seq } else { 0 };
                 if status != 0 {
                     log_warn!(
-                        "begin_frame failed status={} flags=0x{:08x} clear=0x{:06x}",
+                        "begin_frame failed seq={} status={} flags=0x{:08x} clear=0x{:06x}",
+                        seq,
                         status,
                         flags,
                         clear_rgb & 0x00ff_ffff
                     );
                 }
             }
-            RdpMessage::EndFrame => {
-                if self.frame_active {
+            RdpMessage::EndFrame { seq } => {
+                if self.dropping_frame_depth > 0 {
+                    self.dropping_frame_depth = self.dropping_frame_depth.saturating_sub(1);
+                    return;
+                }
+                if self.frame_seq_active(seq) {
                     if adapter.end_frame().is_ok() {
                         self.have_frame = true;
                         self.frames = self.frames.saturating_add(1);
@@ -344,54 +470,79 @@ impl RdpViewer {
                         log_warn!("end_frame failed");
                     }
                     self.frame_active = false;
+                    self.active_frame_seq = 0;
                 } else {
-                    log_warn!("end_frame without active frame");
+                    log_warn!(
+                        "end_frame seq={} without matching active frame seq={}",
+                        seq,
+                        self.active_frame_seq
+                    );
                 }
             }
             RdpMessage::SetBlend {
+                seq,
                 enabled,
                 src_rgb,
                 dst_rgb,
             } => {
-                let _ = adapter.set_blend_raw(enabled, src_rgb, dst_rgb);
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_blend_raw(enabled, src_rgb, dst_rgb);
+                }
             }
             RdpMessage::SetSampler {
+                seq,
                 wrap_s,
                 wrap_t,
                 min_filter,
                 mag_filter,
             } => {
-                let _ = adapter.set_sampler_raw(wrap_s, wrap_t, min_filter, mag_filter);
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_sampler_raw(wrap_s, wrap_t, min_filter, mag_filter);
+                }
             }
             RdpMessage::SetScissor {
+                seq,
                 x,
                 y,
                 width,
                 height,
             } => {
-                let _ = adapter.set_scissor(Some(ScissorRect {
-                    x,
-                    y,
-                    width,
-                    height,
-                }));
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_scissor(Some(ScissorRect {
+                        x,
+                        y,
+                        width,
+                        height,
+                    }));
+                }
             }
-            RdpMessage::ClearScissor => {
-                let _ = adapter.set_scissor(None);
+            RdpMessage::ClearScissor { seq } => {
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_scissor(None);
+                }
             }
-            RdpMessage::SetRenderTarget { tex_id } => {
-                let _ = adapter.set_render_target(tex_id);
+            RdpMessage::SetRenderTarget { seq, tex_id } => {
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_render_target(tex_id);
+                }
             }
-            RdpMessage::ClearRenderTarget => {
-                let _ = adapter.set_render_target(0);
+            RdpMessage::ClearRenderTarget { seq } => {
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.set_render_target(0);
+                }
             }
             RdpMessage::ClearRect {
+                seq,
                 rgb,
                 x,
                 y,
                 width,
                 height,
-            } => draw_clear_rect(adapter, rgb, x, y, width, height),
+            } => {
+                if self.frame_seq_active(seq) {
+                    draw_clear_rect(adapter, rgb, x, y, width, height);
+                }
+            }
             RdpMessage::TextureRgba {
                 tex_id,
                 width,
@@ -400,6 +551,7 @@ impl RdpViewer {
                 rgba,
             } => {
                 upload_texture_rgba(adapter, tex_id, width, height, region, &rgba);
+                self.note_asset_synced();
                 self.textures = self.textures.saturating_add(1);
                 self.bytes_received = self.bytes_received.saturating_add(rgba.len() as u64);
                 if should_log_count(self.textures) {
@@ -430,6 +582,7 @@ impl RdpViewer {
             RdpMessage::TexturePng { tex_id, bytes } => match decode_png_rgba(&bytes) {
                 Ok((width, height, rgba)) => {
                     let _ = adapter.upload_texture_rgba_image(tex_id, width, height, &rgba);
+                    self.note_asset_synced();
                     self.textures = self.textures.saturating_add(1);
                     self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
                     if should_log_count(self.textures) {
@@ -445,6 +598,7 @@ impl RdpViewer {
                     }
                 }
                 Err(err) => {
+                    self.note_asset_synced();
                     log_warn!(
                         "png texture {} decode failed bytes={}: {}",
                         tex_id,
@@ -458,6 +612,7 @@ impl RdpViewer {
             RdpMessage::TextureJpeg { tex_id, bytes } => match decode_jpeg_rgba(&bytes) {
                 Ok((width, height, rgba)) => {
                     let _ = adapter.upload_texture_rgba_image(tex_id, width, height, &rgba);
+                    self.note_asset_synced();
                     self.textures = self.textures.saturating_add(1);
                     self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
                     if should_log_count(self.textures) {
@@ -473,6 +628,7 @@ impl RdpViewer {
                     }
                 }
                 Err(err) => {
+                    self.note_asset_synced();
                     log_warn!(
                         "jpeg texture {} decode failed bytes={}: {}",
                         tex_id,
@@ -485,6 +641,7 @@ impl RdpViewer {
             },
             RdpMessage::TextureSvg { tex_id, bytes } => {
                 upload_svg_placeholder(adapter, tex_id);
+                self.note_asset_synced();
                 self.textures = self.textures.saturating_add(1);
                 self.bytes_received = self.bytes_received.saturating_add(bytes as u64);
                 if should_log_count(self.textures) {
@@ -496,8 +653,10 @@ impl RdpViewer {
                     );
                 }
             }
-            RdpMessage::DrawRgb { bytes } => {
-                let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+            RdpMessage::DrawRgb { seq, bytes } => {
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+                }
                 self.rgb_draws = self.rgb_draws.saturating_add(1);
                 self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
                 if should_log_count(self.rgb_draws) {
@@ -510,17 +669,20 @@ impl RdpViewer {
                 }
             }
             RdpMessage::DrawTex {
+                seq,
                 tex_id,
                 sampler_flags,
                 sample_kind,
                 bytes,
             } => {
-                apply_sampler_flags(adapter, sampler_flags);
-                let _ = adapter.draw_tex_triangles_sample_kind_no_present(
-                    tex_id,
-                    sample_kind,
-                    &bytes,
-                );
+                if self.frame_seq_active(seq) {
+                    apply_sampler_flags(adapter, sampler_flags);
+                    let _ = adapter.draw_tex_triangles_sample_kind_no_present(
+                        tex_id,
+                        sample_kind,
+                        &bytes,
+                    );
+                }
                 self.tex_draws = self.tex_draws.saturating_add(1);
                 self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
                 if should_log_count(self.tex_draws) {
@@ -536,10 +698,25 @@ impl RdpViewer {
                 }
             }
             RdpMessage::SnapshotBegin { textures, bytes } => {
-                log_info!("snapshot begin textures={} bytes={}", textures, bytes);
+                if self.frame_active {
+                    let _ = adapter.end_frame();
+                    self.frame_active = false;
+                    self.active_frame_seq = 0;
+                }
+                self.asset_sync_active = true;
+                self.asset_sync_ready = textures == 0;
+                self.asset_sync_remaining = textures;
+                self.dropping_frame_depth = 0;
+                log_info!("asset sync begin textures={} bytes={}", textures, bytes);
             }
             RdpMessage::SnapshotEnd => {
-                log_info!("snapshot end");
+                self.asset_sync_active = false;
+                self.asset_sync_ready = self.asset_sync_remaining == 0;
+                log_info!(
+                    "asset sync end ready={} pending={}",
+                    self.asset_sync_ready,
+                    self.asset_sync_remaining
+                );
             }
         }
     }
@@ -596,6 +773,19 @@ impl RdpViewer {
         }
         self.emit_keyboard_input();
     }
+
+    fn update_startup_target(&mut self) {
+        let trimmed = self.target_text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        if let Ok(mut target) = self.target.lock() {
+            if target.as_str() != trimmed {
+                *target = trimmed.to_string();
+                log_info!("startup target set to {}", trimmed);
+            }
+        }
+    }
 }
 
 impl FrameProducer for RdpViewer {
@@ -605,6 +795,30 @@ impl FrameProducer for RdpViewer {
     }
 
     fn handle_input(&mut self, event: InputEvent) {
+        if !self.have_frame {
+            match event {
+                InputEvent::TextInput(text) => {
+                    for ch in text.chars() {
+                        if ch.is_ascii_graphic() && !ch.is_ascii_whitespace() {
+                            self.target_text.push(ch);
+                        }
+                    }
+                    self.update_startup_target();
+                    return;
+                }
+                InputEvent::BackspacePressed => {
+                    self.target_text.pop();
+                    self.update_startup_target();
+                    return;
+                }
+                InputEvent::EnterPressed => {
+                    self.update_startup_target();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match event {
             InputEvent::CursorMoved { x, y } => {
                 self.cursor_x = x.clamp(0.0, self.local_width.max(1) as f32);
@@ -657,9 +871,7 @@ impl FrameProducer for RdpViewer {
         self.pending_messages = self.pending_messages.saturating_add(drained as u64);
 
         if !self.have_frame && !self.frame_active {
-            let bg = if self.connected { 0x102030 } else { 0x281820 };
-            let _ = adapter.begin_frame(bg);
-            let _ = adapter.end_frame();
+            self.draw_logo(adapter);
         }
     }
 }
@@ -668,21 +880,18 @@ fn main() {
     let addr = env::args()
         .nth(1)
         .unwrap_or_else(|| DEFAULT_ADDR.to_string());
-    let socket = resolve_addr(&addr).unwrap_or_else(|err| {
-        log_error!("invalid address {}: {}", addr, err);
-        std::process::exit(2);
-    });
     log_info!(
-        "starting target={} resolved={} log_level={}",
+        "starting target={} log_level={}",
         addr,
-        socket,
         configured_log_level().as_str()
     );
     let (tx, rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
-    thread::spawn(move || rdp_reader(socket, tx, input_rx));
+    let target = Arc::new(Mutex::new(addr.clone()));
+    let reader_target = Arc::clone(&target);
+    thread::spawn(move || rdp_reader(reader_target, tx, input_rx));
 
-    let producer = RdpViewer::new(rx, input_tx);
+    let producer = RdpViewer::new(rx, input_tx, target);
     let app = WgpuWindowApp::new(
         format!("TRUEOS RDP Viewer - {}", addr),
         AdapterConfig::default(),
@@ -699,8 +908,24 @@ fn resolve_addr(addr: &str) -> io::Result<SocketAddr> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no socket address resolved"))
 }
 
-fn rdp_reader(addr: SocketAddr, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInput>) {
+fn rdp_reader(target: Arc<Mutex<String>>, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInput>) {
     loop {
+        let addr_text = target
+            .lock()
+            .map(|target| target.clone())
+            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+        let addr = match resolve_addr(&addr_text) {
+            Ok(addr) => addr,
+            Err(err) => {
+                log_warn!("resolve {} failed: {}", addr_text, err);
+                let _ = tx.send(RdpEvent::Disconnected(format!(
+                    "resolve {} failed: {}",
+                    addr_text, err
+                )));
+                thread::sleep(CONNECT_RETRY_DELAY);
+                continue;
+            }
+        };
         log_info!("connecting to {}", addr);
         match TcpStream::connect(addr) {
             Ok(mut stream) => {
@@ -712,6 +937,7 @@ fn rdp_reader(addr: SocketAddr, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInpu
                     log_warn!("read loop ended: {}", err);
                     let _ = tx.send(RdpEvent::Disconnected(err.to_string()));
                 }
+                thread::sleep(CONNECT_RETRY_DELAY);
             }
             Err(err) => {
                 log_warn!("connect {} failed: {}", addr, err);
@@ -719,7 +945,7 @@ fn rdp_reader(addr: SocketAddr, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInpu
                     "connect {} failed: {}",
                     addr, err
                 )));
-                thread::sleep(Duration::from_millis(750));
+                thread::sleep(CONNECT_RETRY_DELAY);
             }
         }
     }
@@ -855,12 +1081,7 @@ fn encode_tablet_input_frame(input: RdpTabletInput) -> Vec<u8> {
 }
 
 fn encode_keyboard_input_frame(input: RdpKeyboardInput) -> Vec<u8> {
-    let keys_lo = u32::from_le_bytes([
-        input.keys[0],
-        input.keys[1],
-        input.keys[2],
-        input.keys[3],
-    ]);
+    let keys_lo = u32::from_le_bytes([input.keys[0], input.keys[1], input.keys[2], input.keys[3]]);
     let keys_hi = u32::from_le_bytes([input.keys[4], input.keys[5], 0, 0]);
     let mut payload = Vec::with_capacity(8 + 16);
     payload.extend_from_slice(b"TRDP");
@@ -910,31 +1131,39 @@ fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
             caps: f(2),
         },
         MSG_BEGIN_FRAME => RdpMessage::BeginFrame {
+            seq: f(0),
             flags: f(1),
             clear_rgb: f(2),
         },
-        MSG_END_FRAME => RdpMessage::EndFrame,
+        MSG_END_FRAME => RdpMessage::EndFrame { seq: f(0) },
         MSG_SET_BLEND => RdpMessage::SetBlend {
+            seq: f(0),
             enabled: f(1),
             src_rgb: f(2),
             dst_rgb: f(3),
         },
         MSG_SET_SAMPLER => RdpMessage::SetSampler {
+            seq: f(0),
             wrap_s: f(1),
             wrap_t: f(2),
             min_filter: f(3),
             mag_filter: f(4),
         },
         MSG_SET_SCISSOR => RdpMessage::SetScissor {
+            seq: f(0),
             x: f(1),
             y: f(2),
             width: f(3),
             height: f(4),
         },
-        MSG_CLEAR_SCISSOR => RdpMessage::ClearScissor,
-        MSG_SET_RENDER_TARGET => RdpMessage::SetRenderTarget { tex_id: f(1) },
-        MSG_CLEAR_RENDER_TARGET => RdpMessage::ClearRenderTarget,
+        MSG_CLEAR_SCISSOR => RdpMessage::ClearScissor { seq: f(0) },
+        MSG_SET_RENDER_TARGET => RdpMessage::SetRenderTarget {
+            seq: f(0),
+            tex_id: f(1),
+        },
+        MSG_CLEAR_RENDER_TARGET => RdpMessage::ClearRenderTarget { seq: f(0) },
         MSG_CLEAR_RECT => RdpMessage::ClearRect {
+            seq: f(0),
             rgb: f(1),
             x: f(2),
             y: f(3),
@@ -981,9 +1210,11 @@ fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
             bytes: data.len(),
         },
         MSG_DRAW_RGB_TRIANGLES => RdpMessage::DrawRgb {
+            seq: f(0),
             bytes: data.to_vec(),
         },
         MSG_DRAW_TEX_TRIANGLES => RdpMessage::DrawTex {
+            seq: f(0),
             tex_id: f(1),
             sampler_flags: f(3),
             sample_kind: TextureSampleKind::from_raw(f(4)),
@@ -1183,4 +1414,329 @@ fn draw_clear_rect(adapter: &mut Adapter, rgb: u32, x: u32, y: u32, width: u32, 
         bytes.extend_from_slice(&[r, g, b, a]);
     }
     let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+}
+
+fn draw_startup_field(adapter: &mut Adapter, width: u32, height: u32, text: &str) {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let scale = if width < 720.0 { 2.0 } else { 3.0 };
+    let text_width = text.chars().count() as f32 * 6.0 * scale;
+    let field_width = (text_width + 48.0).clamp(320.0, (width - 32.0).max(160.0));
+    let field_height = (13.0 * scale + 24.0).clamp(42.0, 64.0);
+    let x0 = (width - field_width) * 0.5;
+    let y0 = (height - field_height) * 0.5;
+    let x1 = x0 + field_width;
+    let y1 = y0 + field_height;
+
+    let mut bytes = Vec::new();
+    push_px_rect(
+        &mut bytes,
+        width,
+        height,
+        x0 - 3.0,
+        y0 - 3.0,
+        x1 + 3.0,
+        y1 + 3.0,
+        0x111a24,
+    );
+    push_px_rect(&mut bytes, width, height, x0, y0, x1, y1, 0xeaf2fb);
+    push_px_rect(
+        &mut bytes,
+        width,
+        height,
+        x0 + 3.0,
+        y0 + 3.0,
+        x1 - 3.0,
+        y1 - 3.0,
+        0x172532,
+    );
+
+    let visible = fit_ascii_text(
+        text,
+        ((field_width - 28.0) / (6.0 * scale)).max(1.0) as usize,
+    );
+    let visible_width = visible.chars().count() as f32 * 6.0 * scale;
+    let text_x = x0 + (field_width - visible_width) * 0.5;
+    let text_y = y0 + (field_height - 7.0 * scale) * 0.5;
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        text_x + 1.0,
+        text_y + 1.0,
+        scale,
+        &visible,
+        0x000814,
+    );
+    push_text(
+        &mut bytes, width, height, text_x, text_y, scale, &visible, 0xf5fbff,
+    );
+
+    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+}
+
+fn fit_ascii_text(text: &str, max_chars: usize) -> String {
+    let count = text.chars().count();
+    if count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(3);
+    format!(
+        "...{}",
+        text.chars()
+            .skip(count.saturating_sub(keep))
+            .collect::<String>()
+    )
+}
+
+fn push_text(
+    bytes: &mut Vec<u8>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    scale: f32,
+    text: &str,
+    rgb: u32,
+) {
+    let mut cursor = x;
+    for ch in text.chars() {
+        push_glyph(bytes, width, height, cursor, y, scale, ch, rgb);
+        cursor += 6.0 * scale;
+    }
+}
+
+fn push_glyph(
+    bytes: &mut Vec<u8>,
+    width: f32,
+    height: f32,
+    x: f32,
+    y: f32,
+    scale: f32,
+    ch: char,
+    rgb: u32,
+) {
+    let glyph = glyph_bits(ch);
+    for (row, bits) in glyph.iter().enumerate() {
+        for col in 0..5 {
+            if bits & (1 << (4 - col)) != 0 {
+                let px = x + col as f32 * scale;
+                let py = y + row as f32 * scale;
+                push_px_rect(bytes, width, height, px, py, px + scale, py + scale, rgb);
+            }
+        }
+    }
+}
+
+fn push_px_rect(
+    bytes: &mut Vec<u8>,
+    width: f32,
+    height: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    rgb: u32,
+) {
+    let x0 = px_to_clip_x(x0, width);
+    let y0 = px_to_clip_y(y0, height);
+    let x1 = px_to_clip_x(x1, width);
+    let y1 = px_to_clip_y(y1, height);
+    let r = ((rgb >> 16) & 0xFF) as u8;
+    let g = ((rgb >> 8) & 0xFF) as u8;
+    let b = (rgb & 0xFF) as u8;
+    let vertices = [
+        (x0, y0, r, g, b, 255),
+        (x1, y0, r, g, b, 255),
+        (x1, y1, r, g, b, 255),
+        (x0, y0, r, g, b, 255),
+        (x1, y1, r, g, b, 255),
+        (x0, y1, r, g, b, 255),
+    ];
+    for (x, y, r, g, b, a) in vertices {
+        bytes.extend_from_slice(&x.to_le_bytes());
+        bytes.extend_from_slice(&y.to_le_bytes());
+        bytes.extend_from_slice(&[r, g, b, a]);
+    }
+}
+
+fn px_to_clip_x(x: f32, width: f32) -> f32 {
+    x / width.max(1.0) * 2.0 - 1.0
+}
+
+fn px_to_clip_y(y: f32, height: f32) -> f32 {
+    1.0 - y / height.max(1.0) * 2.0
+}
+
+fn glyph_bits(ch: char) -> [u8; 7] {
+    match ch.to_ascii_lowercase() {
+        'a' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'b' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'c' => [
+            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
+        ],
+        'd' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'e' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'f' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'g' => [
+            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
+        ],
+        'h' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'i' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'j' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'k' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'l' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'm' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'n' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'o' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'p' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'r' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        's' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        't' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'u' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'v' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'w' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
+        ],
+        'x' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        ':' => [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        ' ' => [0; 7],
+        _ => [
+            0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+    }
+}
+
+fn logo_vertices(
+    logo_width: u32,
+    logo_height: u32,
+    viewport_width: u32,
+    viewport_height: u32,
+) -> Vec<u8> {
+    let (u0, v0, u1, v1) = if logo_width == 0
+        || logo_height == 0
+        || viewport_width == 0
+        || viewport_height == 0
+    {
+        (0.0f32, 0.0f32, 1.0f32, 1.0f32)
+    } else {
+        let logo_aspect = logo_width as f32 / logo_height as f32;
+        let viewport_aspect = viewport_width as f32 / viewport_height as f32;
+        if logo_aspect > viewport_aspect {
+            let visible_u = (viewport_aspect / logo_aspect).clamp(0.0, 1.0);
+            let u0 = (1.0 - visible_u) * 0.5;
+            (u0, 0.0, 1.0 - u0, 1.0)
+        } else {
+            let visible_v = (logo_aspect / viewport_aspect).clamp(0.0, 1.0);
+            let v0 = (1.0 - visible_v) * 0.5;
+            (0.0, v0, 1.0, 1.0 - v0)
+        }
+    };
+    let vertices = [
+        (-1.0f32, 1.0f32, u0, v0),
+        (1.0f32, 1.0f32, u1, v0),
+        (1.0f32, -1.0f32, u1, v1),
+        (-1.0f32, 1.0f32, u0, v0),
+        (1.0f32, -1.0f32, u1, v1),
+        (-1.0f32, -1.0f32, u0, v1),
+    ];
+    let mut bytes = Vec::with_capacity(vertices.len() * 20);
+    for (x, y, u, v) in vertices {
+        bytes.extend_from_slice(&x.to_le_bytes());
+        bytes.extend_from_slice(&y.to_le_bytes());
+        bytes.extend_from_slice(&u.to_le_bytes());
+        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&[255, 255, 255, 255]);
+    }
+    bytes
 }
