@@ -122,6 +122,7 @@ pub enum InputKey {
     J,
     H,
     K,
+    Tab,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -2161,6 +2162,7 @@ fn input_event(event: &WindowEvent) -> Option<InputEvent> {
                 PhysicalKey::Code(KeyCode::KeyJ) => Some(InputEvent::KeyPressed(InputKey::J)),
                 PhysicalKey::Code(KeyCode::KeyH) => Some(InputEvent::KeyPressed(InputKey::H)),
                 PhysicalKey::Code(KeyCode::KeyK) => Some(InputEvent::KeyPressed(InputKey::K)),
+                PhysicalKey::Code(KeyCode::Tab) => Some(InputEvent::KeyPressed(InputKey::Tab)),
                 _ => match &event.logical_key {
                     Key::Named(NamedKey::Escape) => Some(InputEvent::EscapePressed),
                     Key::Named(NamedKey::Backspace) => Some(InputEvent::BackspacePressed),

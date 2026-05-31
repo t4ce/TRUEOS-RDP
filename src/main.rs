@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use adapterlibgfx::api::{Adapter, AdapterConfig};
 use adapterlibgfx::command::{Frame, FrameCommand, ScissorRect, TextureSampleKind};
 use adapterlibgfx::window::{
-    FrameProducer, InputButtonState, InputEvent, InputMouseButton, WgpuWindowApp,
+    FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
 };
 use zune_core::bytestream::ZCursor;
 use zune_core::colorspace::ColorSpace;
@@ -20,6 +20,7 @@ use zune_jpeg::JpegDecoder;
 
 const PROTOCOL_VERSION: u16 = 1;
 const DEFAULT_ADDR: &str = "trueos.eu:100";
+const FIXED_RDP_PORT: &str = "100";
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 const RESIZE_RECOMPOSE_SETTLE_DELAY: Duration = Duration::from_millis(160);
@@ -271,6 +272,7 @@ struct RdpViewer {
     keyboard_modifiers: u8,
     keyboard_keys: [u8; 6],
     resize_recompose_due: Option<Instant>,
+    startup_host_mode: bool,
     logo_texture_ready: bool,
     logo_width: u32,
     logo_height: u32,
@@ -283,6 +285,7 @@ impl RdpViewer {
             .lock()
             .map(|target| target.clone())
             .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+        let startup_host_mode = !looks_like_ip(split_target(&target_text).0);
         Self {
             rx,
             input_tx,
@@ -314,6 +317,7 @@ impl RdpViewer {
             keyboard_modifiers: 0,
             keyboard_keys: [0; 6],
             resize_recompose_due: None,
+            startup_host_mode,
             logo_texture_ready: false,
             logo_width: 0,
             logo_height: 0,
@@ -871,12 +875,32 @@ impl RdpViewer {
         if trimmed.is_empty() {
             return;
         }
+        let (host, _) = split_target(trimmed);
+        if host.trim().is_empty() {
+            return;
+        }
+        let connect_target = format!("{}:{}", host.trim(), FIXED_RDP_PORT);
         if let Ok(mut target) = self.target.lock() {
-            if target.as_str() != trimmed {
-                *target = trimmed.to_string();
-                log_info!("startup target set to {}", trimmed);
+            if target.as_str() != connect_target {
+                *target = connect_target.clone();
+                log_info!("startup target set to {}", connect_target);
             }
         }
+    }
+
+    fn toggle_startup_mode(&mut self) {
+        self.startup_host_mode = !self.startup_host_mode;
+        self.set_startup_mode(self.startup_host_mode);
+    }
+
+    fn set_startup_mode(&mut self, host_mode: bool) {
+        self.startup_host_mode = host_mode;
+        self.target_text = if self.startup_host_mode {
+            "trueos.eu".to_string()
+        } else {
+            "1.1.1.1".to_string()
+        };
+        self.update_startup_target();
     }
 }
 
@@ -907,6 +931,24 @@ impl FrameProducer for RdpViewer {
                 InputEvent::EnterPressed => {
                     self.update_startup_target();
                     return;
+                }
+                InputEvent::KeyPressed(InputKey::Tab) => {
+                    self.toggle_startup_mode();
+                    return;
+                }
+                InputEvent::MouseButton {
+                    button: InputMouseButton::Left,
+                    state: InputButtonState::Pressed,
+                } => {
+                    if let Some(host_mode) = startup_tab_hit(
+                        self.local_width,
+                        self.local_height,
+                        self.cursor_x,
+                        self.cursor_y,
+                    ) {
+                        self.set_startup_mode(host_mode);
+                        return;
+                    }
                 }
                 _ => {}
             }
@@ -1033,7 +1075,7 @@ fn rdp_reader(target: Arc<Mutex<String>>, tx: Sender<RdpEvent>, input_rx: Receiv
             }
         };
         log_info!("connecting to {}", addr);
-        match TcpStream::connect(addr) {
+        match TcpStream::connect_timeout(&addr, CONNECT_RETRY_DELAY) {
             Ok(mut stream) => {
                 log_info!("tcp connected to {}", addr);
                 let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
@@ -1550,27 +1592,37 @@ fn draw_startup_panel(
     let height = height.max(1) as f32;
     let scale: f32 = if width < 720.0 { 2.0 } else { 3.0 };
     let ui_scale = (width / 760.0).clamp(0.72, 1.25);
-    let (host, port) = split_target(target);
-    let ip_mode = looks_like_ip(host);
-
-    let panel_w = (730.0 * ui_scale).min(width - 24.0).max(360.0);
-    let panel_h = 188.0 * ui_scale;
-    let x0 = (width - panel_w) * 0.5;
-    let y0 = (height * 0.5 - panel_h * 0.58).clamp(18.0, (height - panel_h - 72.0).max(18.0));
-    let x1 = x0 + panel_w;
-    let y1 = y0 + panel_h;
+    let (host, _port) = split_target(target);
+    let host_mode = !looks_like_ip(host);
 
     let stroke = 3.0 * ui_scale;
     let gap = 12.0 * ui_scale;
     let pad = 30.0 * ui_scale;
     let label_scale = (scale * 0.72).max(1.5);
-    let value_scale = (scale * 1.45).max(3.0);
-    let tab_scale = (scale * 1.35).max(3.0);
+    let line_scale = (scale * 1.18).max(2.5);
+    let value_scale = line_scale;
+    let tab_scale = line_scale;
+    let border_color = 0x6f767d;
+    let selected_color = 0xff37ff;
+    let label_h = 7.0 * label_scale;
+    let label_gap = 8.0 * ui_scale;
+    let input_h = 56.0 * ui_scale;
+    let base_content_w = 730.0 * ui_scale - 2.0 * pad;
+    let input_w = base_content_w * 0.43;
+    let tab_w = base_content_w * 0.22;
+    let row_w = input_w + gap + tab_w;
+    let panel_w = (row_w + 2.0 * (gap + stroke))
+        .min(width - 24.0)
+        .max(360.0);
+    let panel_h = pad + input_h + gap + stroke;
+    let x0 = (width - panel_w) * 0.5;
+    let y0 = pad.min((height - panel_h - 72.0).max(18.0));
+    let x1 = x0 + panel_w;
+    let y1 = y0 + panel_h;
 
     let mut bytes = Vec::new();
 
-    push_px_rect(&mut bytes, width, height, x0, y0, x1, y1, 0x3267a8);
-    push_px_rect(
+    push_px_rect_alpha(
         &mut bytes,
         width,
         height,
@@ -1579,15 +1631,14 @@ fn draw_startup_panel(
         x1 - stroke,
         y1 - stroke,
         0xf8fbff,
+        128,
     );
-
-    let label_y = y0 + 10.0 * ui_scale;
-    let input_x0 = x0 + pad;
-    let input_y0 = y0 + 56.0 * ui_scale;
-    let input_h = 92.0 * ui_scale;
-    let tab_x0 = x0 + panel_w * 0.60;
-    let input_x1 = tab_x0 - gap;
-    let tab_w = x1 - pad - tab_x0;
+    let label_y = y0 + pad - label_gap - label_h;
+    let content_x0 = x0 + gap + stroke;
+    let input_x0 = content_x0;
+    let input_y0 = y0 + pad;
+    let input_x1 = input_x0 + input_w;
+    let tab_x0 = input_x1 + gap;
     let tab_mid = tab_x0 + tab_w * 0.34;
     let tab_y1 = input_y0 + input_h;
 
@@ -1613,7 +1664,7 @@ fn draw_startup_panel(
     );
 
     draw_stroked_box(
-        &mut bytes, width, height, input_x0, input_y0, input_x1, tab_y1, stroke, 0x3267a8, 0xffffff,
+        &mut bytes, width, height, input_x0, input_y0, input_x1, tab_y1, stroke, border_color, 0xffffff,
     );
     draw_stroked_box(
         &mut bytes,
@@ -1621,15 +1672,19 @@ fn draw_startup_panel(
         height,
         tab_x0,
         input_y0,
-        x1 - pad,
+        tab_x0 + tab_w,
         tab_y1,
         stroke,
-        0x3267a8,
+        border_color,
         0xffffff,
     );
-    let selected_x0 = if ip_mode { tab_x0 + stroke } else { tab_mid };
-    let selected_x1 = if ip_mode { tab_mid } else { x1 - pad - stroke };
-    push_px_rect(
+    let selected_x0 = if host_mode { tab_mid } else { tab_x0 + stroke };
+    let selected_x1 = if host_mode {
+        tab_x0 + tab_w - stroke
+    } else {
+        tab_mid
+    };
+    push_px_rect_alpha(
         &mut bytes,
         width,
         height,
@@ -1637,7 +1692,8 @@ fn draw_startup_panel(
         input_y0 + stroke,
         selected_x1,
         tab_y1 - stroke,
-        0xb6cbe2,
+        selected_color,
+        255,
     );
     push_px_rect(
         &mut bytes,
@@ -1647,32 +1703,33 @@ fn draw_startup_panel(
         input_y0,
         tab_mid + stroke * 0.5,
         tab_y1,
-        0x3267a8,
+        border_color,
     );
 
     let host_visible = fit_ascii_text(
         host,
         ((input_x1 - input_x0 - 36.0 * ui_scale) / (6.0 * value_scale)).max(1.0) as usize,
     );
+    let value_y = input_y0 + (input_h - 7.0 * value_scale) * 0.5;
     push_text(
         &mut bytes,
         width,
         height,
         input_x0 + 24.0 * ui_scale,
-        input_y0 + 33.0 * ui_scale,
+        value_y,
         value_scale,
         &host_visible,
         0x000000,
     );
-    let port_label = format!("PORT {}", port.unwrap_or("100"));
-    let port_scale = (scale * 0.7).max(1.5);
+    let port_label = "PORT 100";
+    let port_scale = label_scale;
     let port_w = port_label.chars().count() as f32 * 6.0 * port_scale;
     push_text(
         &mut bytes,
         width,
         height,
         input_x1 - port_w - 10.0 * ui_scale,
-        tab_y1 - 27.0 * ui_scale,
+        tab_y1 - 22.0 * ui_scale,
         port_scale,
         &port_label,
         0x000000,
@@ -1682,8 +1739,8 @@ fn draw_startup_panel(
         &mut bytes,
         width,
         height,
-        tab_x0 + 25.0 * ui_scale,
-        input_y0 + 33.0 * ui_scale,
+        center_text_x(tab_x0, tab_mid, "IP", tab_scale),
+        value_y,
         tab_scale,
         "IP",
         0x000000,
@@ -1692,18 +1749,17 @@ fn draw_startup_panel(
         &mut bytes,
         width,
         height,
-        tab_mid + 28.0 * ui_scale,
-        input_y0 + 33.0 * ui_scale,
+        center_text_x(tab_mid, tab_x0 + tab_w, "HOST", tab_scale),
+        value_y,
         tab_scale,
         "HOST",
         0x000000,
     );
 
     let line = startup_status_line(status, elapsed);
-    let line_scale = (scale * 1.18).max(2.5);
     let line_w = line.chars().count() as f32 * 6.0 * line_scale;
     let line_x = (width - line_w) * 0.5;
-    let line_y = y1 + 18.0 * ui_scale;
+    let line_y = (height - pad - 7.0 * line_scale).max(y1 + pad);
     push_text(
         &mut bytes,
         width,
@@ -1718,7 +1774,9 @@ fn draw_startup_panel(
         &mut bytes, width, height, line_x, line_y, line_scale, &line, 0x000000,
     );
 
+    let _ = adapter.set_blend_raw(1, 0x0302, 0x0303);
     let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+    let _ = adapter.set_blend_raw(0, 1, 0);
 }
 
 fn draw_stroked_box(
@@ -1772,6 +1830,43 @@ fn looks_like_ip(host: &str) -> bool {
     parts == 4
 }
 
+fn startup_tab_hit(width: u32, height: u32, x: f32, y: f32) -> Option<bool> {
+    let width = width.max(1) as f32;
+    let height = height.max(1) as f32;
+    let scale: f32 = if width < 720.0 { 2.0 } else { 3.0 };
+    let ui_scale = (width / 760.0).clamp(0.72, 1.25);
+
+    let stroke = 3.0 * ui_scale;
+    let gap = 12.0 * ui_scale;
+    let pad = 30.0 * ui_scale;
+    let line_scale = (scale * 1.18).max(2.5);
+    let input_h = 56.0 * ui_scale;
+    let base_content_w = 730.0 * ui_scale - 2.0 * pad;
+    let input_w = base_content_w * 0.43;
+    let tab_w = base_content_w * 0.22;
+    let row_w = input_w + gap + tab_w;
+    let panel_w = (row_w + 2.0 * (gap + stroke))
+        .min(width - 24.0)
+        .max(360.0);
+    let panel_h = pad + input_h + gap + stroke;
+    let x0 = (width - panel_w) * 0.5;
+    let y0 = pad.min((height - panel_h - 72.0).max(18.0));
+    let content_x0 = x0 + gap + stroke;
+    let input_x0 = content_x0;
+    let input_y0 = y0 + pad;
+    let input_x1 = input_x0 + input_w;
+    let tab_x0 = input_x1 + gap;
+    let tab_mid = tab_x0 + tab_w * 0.34;
+    let tab_x1 = tab_x0 + tab_w;
+    let tab_y1 = input_y0 + input_h;
+    let _ = line_scale;
+
+    if y < input_y0 || y > tab_y1 || x < tab_x0 || x > tab_x1 {
+        return None;
+    }
+    Some(x >= tab_mid)
+}
+
 fn startup_status_line(status: Option<&str>, elapsed: Duration) -> String {
     if let Some(status) = status {
         if status.starts_with("connected") {
@@ -1803,6 +1898,11 @@ fn fit_ascii_text(text: &str, max_chars: usize) -> String {
             .skip(count.saturating_sub(keep))
             .collect::<String>()
     )
+}
+
+fn center_text_x(x0: f32, x1: f32, text: &str, scale: f32) -> f32 {
+    let text_w = text.chars().count() as f32 * 6.0 * scale;
+    x0 + (x1 - x0 - text_w).max(0.0) * 0.5
 }
 
 fn push_text(
@@ -1854,6 +1954,20 @@ fn push_px_rect(
     y1: f32,
     rgb: u32,
 ) {
+    push_px_rect_alpha(bytes, width, height, x0, y0, x1, y1, rgb, 255);
+}
+
+fn push_px_rect_alpha(
+    bytes: &mut Vec<u8>,
+    width: f32,
+    height: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    rgb: u32,
+    alpha: u8,
+) {
     let x0 = px_to_clip_x(x0, width);
     let y0 = px_to_clip_y(y0, height);
     let x1 = px_to_clip_x(x1, width);
@@ -1862,12 +1976,12 @@ fn push_px_rect(
     let g = ((rgb >> 8) & 0xFF) as u8;
     let b = (rgb & 0xFF) as u8;
     let vertices = [
-        (x0, y0, r, g, b, 255),
-        (x1, y0, r, g, b, 255),
-        (x1, y1, r, g, b, 255),
-        (x0, y0, r, g, b, 255),
-        (x1, y1, r, g, b, 255),
-        (x0, y1, r, g, b, 255),
+        (x0, y0, r, g, b, alpha),
+        (x1, y0, r, g, b, alpha),
+        (x1, y1, r, g, b, alpha),
+        (x0, y0, r, g, b, alpha),
+        (x1, y1, r, g, b, alpha),
+        (x0, y1, r, g, b, alpha),
     ];
     for (x, y, r, g, b, a) in vertices {
         bytes.extend_from_slice(&x.to_le_bytes());
