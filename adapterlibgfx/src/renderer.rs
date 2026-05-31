@@ -8,8 +8,9 @@ use winit::dpi::PhysicalSize;
 use winit::window::Window;
 
 use crate::command::{
-    BlendFactor, BlendState, Frame, FrameCommand, SamplerFilter, SamplerState, SamplerWrap,
-    ScissorRect, TextureEffect, TextureSampleKind,
+    BlendFactor, BlendState, Frame, FrameCommand, PipelineResource, SamplerFilter, SamplerState,
+    SamplerWrap, ScissorRect, ShaderFormat, ShaderStage, TexCoordFormat, TextureEffect,
+    TextureSampleKind,
 };
 use crate::texture::{TextureImage, TextureRegistry};
 use crate::vertex::{GpuRgbVertex, GpuTexVertex, RgbVertex, TexVertex};
@@ -240,6 +241,13 @@ struct PipelineKey {
     format: wgpu::TextureFormat,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct RemotePipelineKey {
+    pipeline_id: u32,
+    blend: BlendState,
+    format: wgpu::TextureFormat,
+}
+
 struct GpuTexture {
     width: u32,
     height: u32,
@@ -263,6 +271,8 @@ pub struct WgpuRenderer {
     frame_layout: wgpu::BindGroupLayout,
     texture_layout: wgpu::BindGroupLayout,
     pipelines: HashMap<PipelineKey, wgpu::RenderPipeline>,
+    remote_shaders: HashMap<u32, wgpu::ShaderModule>,
+    remote_pipelines: HashMap<RemotePipelineKey, wgpu::RenderPipeline>,
     textures: HashMap<u32, GpuTexture>,
     sampler: SamplerState,
     texture_effect: TextureEffect,
@@ -386,6 +396,8 @@ impl WgpuRenderer {
             frame_layout,
             texture_layout,
             pipelines: HashMap::new(),
+            remote_shaders: HashMap::new(),
+            remote_pipelines: HashMap::new(),
             textures: HashMap::new(),
             sampler: SamplerState::default(),
             texture_effect: TextureEffect::default(),
@@ -457,6 +469,7 @@ impl WgpuRenderer {
         frame: &Frame,
     ) -> Result<(), RenderError> {
         self.sync_textures(textures);
+        self.sync_remote_shaders(frame);
         let surface_texture = if frame.allow_present {
             match self.surface.get_current_texture() {
                 Ok(texture) => Some(texture),
@@ -593,6 +606,38 @@ impl WgpuRenderer {
                         );
                     }
                 }
+                FrameCommand::DrawPipeline {
+                    pipeline_id,
+                    vertices,
+                } => {
+                    let view = self.target_view(current_target)?;
+                    let format = self.target_format(current_target);
+                    let load = self.load_op_for_target(&mut cleared_targets, current_target, frame);
+                    if current_target == 0 {
+                        let vertices = self.surface_tex_vertices(vertices, frame);
+                        self.draw_pipeline(
+                            &mut encoder,
+                            &view,
+                            format,
+                            load,
+                            &frame_bind_group,
+                            frame.pipelines.get(pipeline_id),
+                            *pipeline_id,
+                            &vertices,
+                        )?;
+                    } else {
+                        self.draw_pipeline(
+                            &mut encoder,
+                            &view,
+                            format,
+                            load,
+                            &frame_bind_group,
+                            frame.pipelines.get(pipeline_id),
+                            *pipeline_id,
+                            vertices,
+                        )?;
+                    }
+                }
             }
         }
 
@@ -639,6 +684,27 @@ impl WgpuRenderer {
                 let gpu = self.create_or_upload_texture(tex_id, image);
                 self.textures.insert(tex_id, gpu);
             }
+        }
+    }
+
+    fn sync_remote_shaders(&mut self, frame: &Frame) {
+        for (&shader_id, shader) in &frame.shaders {
+            if self.remote_shaders.contains_key(&shader_id) {
+                continue;
+            }
+            if shader.id != shader_id
+                || !matches!(shader.stage, ShaderStage::Fragment)
+                || !matches!(shader.format, ShaderFormat::Wgsl)
+            {
+                continue;
+            }
+            let module = self
+                .device
+                .create_shader_module(wgpu::ShaderModuleDescriptor {
+                    label: Some("adapterlibgfx-rdp-wgsl-shader"),
+                    source: wgpu::ShaderSource::Wgsl(shader.source.clone().into()),
+                });
+            self.remote_shaders.insert(shader_id, module);
         }
     }
 
@@ -882,6 +948,58 @@ impl WgpuRenderer {
         pass.draw(0..gpu_vertices.len() as u32, 0..1);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn draw_pipeline(
+        &mut self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        format: wgpu::TextureFormat,
+        load: wgpu::LoadOp<wgpu::Color>,
+        frame_bind_group: &wgpu::BindGroup,
+        pipeline: Option<&PipelineResource>,
+        pipeline_id: u32,
+        vertices: &[crate::vertex::TexVertex],
+    ) -> Result<(), RenderError> {
+        if vertices.is_empty() {
+            return Ok(());
+        }
+        let Some(pipeline_desc) = pipeline else {
+            return Ok(());
+        };
+        if pipeline_desc.id != pipeline_id
+            || pipeline_desc.vertex_layout.stride != crate::vertex::TEX_VERTEX_SIZE as u32
+            || pipeline_desc.vertex_layout.pos_offset != 0
+            || pipeline_desc.vertex_layout.texcoord_offset != 8
+            || pipeline_desc.vertex_layout.color_offset != 16
+            || !matches!(pipeline_desc.vertex_layout.texcoord_format, TexCoordFormat::UvF32)
+            || !self.remote_shaders.contains_key(&pipeline_desc.fs_shader_id)
+        {
+            return Ok(());
+        }
+        let gpu_vertices = vertices
+            .iter()
+            .copied()
+            .map(GpuTexVertex::from)
+            .collect::<Vec<_>>();
+        let vertex_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("adapterlibgfx-pipeline-vertices"),
+                contents: bytemuck::cast_slice(&gpu_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let pipeline = self.remote_pipeline(pipeline_desc, format).clone();
+        let mut pass = self.begin_draw_pass(encoder, view, load);
+        pass.set_pipeline(&pipeline);
+        pass.set_bind_group(0, frame_bind_group, &[]);
+        if let Some(scissor) = self.scissor {
+            pass.set_scissor_rect(scissor.x, scissor.y, scissor.width, scissor.height);
+        }
+        pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+        pass.draw(0..gpu_vertices.len() as u32, 0..1);
+        Ok(())
+    }
+
     fn begin_draw_pass<'a>(
         &'a self,
         encoder: &'a mut wgpu::CommandEncoder,
@@ -973,6 +1091,70 @@ impl WgpuRenderer {
                 fragment: Some(wgpu::FragmentState {
                     module: &self.shader,
                     entry_point: Some(fs),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: key.format,
+                        blend: blend_state_to_wgpu(key.blend),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            })
+    }
+
+    fn remote_pipeline(
+        &mut self,
+        pipeline: &PipelineResource,
+        format: wgpu::TextureFormat,
+    ) -> &wgpu::RenderPipeline {
+        let key = RemotePipelineKey {
+            pipeline_id: pipeline.id,
+            blend: self.blend,
+            format,
+        };
+        if !self.remote_pipelines.contains_key(&key) {
+            let render_pipeline = self.create_remote_pipeline(pipeline, key);
+            self.remote_pipelines.insert(key, render_pipeline);
+        }
+        self.remote_pipelines.get(&key).unwrap()
+    }
+
+    fn create_remote_pipeline(
+        &self,
+        pipeline: &PipelineResource,
+        key: RemotePipelineKey,
+    ) -> wgpu::RenderPipeline {
+        let fragment = self
+            .remote_shaders
+            .get(&pipeline.fs_shader_id)
+            .unwrap_or(&self.shader);
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("adapterlibgfx-rdp-pipeline-layout"),
+                bind_group_layouts: &[&self.frame_layout],
+                push_constant_ranges: &[],
+            });
+        self.device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("adapterlibgfx-rdp-pipeline"),
+                layout: Some(&layout),
+                vertex: wgpu::VertexState {
+                    module: &self.shader,
+                    entry_point: Some("tex_vs"),
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                    buffers: &[GpuTexVertex::layout()],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: fragment,
+                    entry_point: Some("fs_main"),
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: key.format,
@@ -1198,6 +1380,7 @@ impl WgpuHeadlessRenderer {
                         );
                     }
                 }
+                FrameCommand::DrawPipeline { .. } => {}
             }
         }
 

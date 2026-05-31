@@ -107,6 +107,9 @@ const MSG_DRAW_RGB_TRIANGLES: u16 = 15;
 const MSG_DRAW_TEX_TRIANGLES: u16 = 16;
 const MSG_RESOURCE_SNAPSHOT_BEGIN: u16 = 17;
 const MSG_RESOURCE_SNAPSHOT_END: u16 = 18;
+const MSG_SHADER_CREATE: u16 = 19;
+const MSG_PIPELINE_CREATE: u16 = 20;
+const MSG_DRAW_PIPELINE_TRIANGLES: u16 = 21;
 const MSG_INPUT_TABLET_ABS: u16 = 100;
 const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const MSG_CLIENT_RECOMPOSE: u16 = 102;
@@ -204,6 +207,29 @@ enum RdpMessage {
         tex_id: u32,
         sampler_flags: u32,
         sample_kind: TextureSampleKind,
+        bytes: Vec<u8>,
+    },
+    ShaderCreate {
+        shader_id: u32,
+        stage: u32,
+        format: u32,
+        flags: u32,
+        bytes: Vec<u8>,
+    },
+    PipelineCreate {
+        pipeline_id: u32,
+        stride: u32,
+        pos_offset: u32,
+        color_offset: u32,
+        color_format: u32,
+        texcoord_offset: u32,
+        texcoord_format: u32,
+        vs_shader_id: u32,
+        fs_shader_id: u32,
+    },
+    DrawPipeline {
+        seq: u32,
+        pipeline_id: u32,
         bytes: Vec<u8>,
     },
     SnapshotBegin {
@@ -385,8 +411,14 @@ impl RdpViewer {
                 FrameCommand::DrawTex { .. } if target == 0 => {
                     screen_tex = screen_tex.saturating_add(1)
                 }
+                FrameCommand::DrawPipeline { .. } if target == 0 => {
+                    screen_tex = screen_tex.saturating_add(1)
+                }
                 FrameCommand::DrawRgb { .. } => offscreen_rgb = offscreen_rgb.saturating_add(1),
                 FrameCommand::DrawTex { .. } => offscreen_tex = offscreen_tex.saturating_add(1),
+                FrameCommand::DrawPipeline { .. } => {
+                    offscreen_tex = offscreen_tex.saturating_add(1)
+                }
                 _ => {}
             }
         }
@@ -782,6 +814,105 @@ impl RdpViewer {
                         bytes.len() / 20,
                         sampler_flags,
                         sample_kind,
+                        bytes.len()
+                    );
+                }
+            }
+            RdpMessage::ShaderCreate {
+                shader_id,
+                stage,
+                format,
+                flags,
+                bytes,
+            } => {
+                let rc = adapter.create_shader_raw(shader_id, stage, format, &bytes);
+                if rc != 0 {
+                    log_warn!(
+                        "shader_create failed shader={} stage={} format={} flags=0x{:08x} rc={} bytes={}",
+                        shader_id,
+                        stage,
+                        format,
+                        flags,
+                        rc,
+                        bytes.len()
+                    );
+                } else {
+                    self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
+                    log_trace!(
+                        "shader_create shader={} stage={} format={} flags=0x{:08x} bytes={}",
+                        shader_id,
+                        stage,
+                        format,
+                        flags,
+                        bytes.len()
+                    );
+                }
+            }
+            RdpMessage::PipelineCreate {
+                pipeline_id,
+                stride,
+                pos_offset,
+                color_offset,
+                color_format,
+                texcoord_offset,
+                texcoord_format,
+                vs_shader_id,
+                fs_shader_id,
+            } => {
+                let rc = adapter.create_pipeline_raw(
+                    pipeline_id,
+                    stride,
+                    pos_offset,
+                    color_offset,
+                    color_format,
+                    texcoord_offset,
+                    texcoord_format,
+                    vs_shader_id,
+                    fs_shader_id,
+                );
+                if rc != 0 {
+                    log_warn!(
+                        "pipeline_create failed pipeline={} vs={} fs={} rc={}",
+                        pipeline_id,
+                        vs_shader_id,
+                        fs_shader_id,
+                        rc
+                    );
+                } else {
+                    log_trace!(
+                        "pipeline_create pipeline={} stride={} vs={} fs={}",
+                        pipeline_id,
+                        stride,
+                        vs_shader_id,
+                        fs_shader_id
+                    );
+                }
+            }
+            RdpMessage::DrawPipeline {
+                seq,
+                pipeline_id,
+                bytes,
+            } => {
+                if self.frame_seq_active(seq) {
+                    let rc = adapter.draw_pipeline_triangles_no_present(pipeline_id, &bytes);
+                    if rc != 0 {
+                        log_warn!(
+                            "draw_pipeline failed seq={} pipeline={} rc={} bytes={}",
+                            seq,
+                            pipeline_id,
+                            rc,
+                            bytes.len()
+                        );
+                    }
+                }
+                self.tex_draws = self.tex_draws.saturating_add(1);
+                self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
+                if should_log_count(self.tex_draws) {
+                    log_trace!(
+                        "draw_pipeline #{} pipeline={} vertices={} bytes={}",
+                        self.tex_draws,
+                        pipeline_id,
+                        bytes.len() / 20,
                         bytes.len()
                     );
                 }
@@ -1384,6 +1515,51 @@ fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
             sample_kind: TextureSampleKind::from_raw(f(4)),
             bytes: data.to_vec(),
         },
+        MSG_SHADER_CREATE => {
+            let expected = f(4) as usize;
+            if data.len() < expected {
+                return Err(format!(
+                    "short shader {}: got {}, expected {}",
+                    f(0),
+                    data.len(),
+                    expected
+                ));
+            }
+            RdpMessage::ShaderCreate {
+                shader_id: f(0),
+                stage: f(1),
+                format: f(2),
+                flags: f(3),
+                bytes: data[..expected].to_vec(),
+            }
+        }
+        MSG_PIPELINE_CREATE => RdpMessage::PipelineCreate {
+            pipeline_id: f(0),
+            stride: f(1),
+            pos_offset: f(2),
+            color_offset: f(3),
+            color_format: f(4),
+            texcoord_offset: f(5),
+            texcoord_format: f(6),
+            vs_shader_id: f(7),
+            fs_shader_id: f(8),
+        },
+        MSG_DRAW_PIPELINE_TRIANGLES => {
+            let expected = f(3) as usize;
+            if data.len() < expected {
+                return Err(format!(
+                    "short pipeline draw {}: got {}, expected {}",
+                    f(1),
+                    data.len(),
+                    expected
+                ));
+            }
+            RdpMessage::DrawPipeline {
+                seq: f(0),
+                pipeline_id: f(1),
+                bytes: data[..expected].to_vec(),
+            }
+        }
         MSG_RESOURCE_SNAPSHOT_BEGIN => RdpMessage::SnapshotBegin {
             textures: f(0),
             bytes: f(1),
@@ -1410,6 +1586,9 @@ fn field_count(msg: u16) -> Result<usize, String> {
         MSG_TEXTURE_PNG | MSG_TEXTURE_JPEG | MSG_TEXTURE_SVG => Ok(3),
         MSG_DRAW_RGB_TRIANGLES => Ok(3),
         MSG_DRAW_TEX_TRIANGLES => Ok(6),
+        MSG_SHADER_CREATE => Ok(5),
+        MSG_PIPELINE_CREATE => Ok(9),
+        MSG_DRAW_PIPELINE_TRIANGLES => Ok(4),
         MSG_RESOURCE_SNAPSHOT_BEGIN | MSG_RESOURCE_SNAPSHOT_END => Ok(3),
         _ => Err(format!("unknown rdp message {}", msg)),
     }

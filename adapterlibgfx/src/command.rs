@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::vertex::{RgbVertex, TexVertex};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -148,6 +150,100 @@ pub struct ScissorRect {
     pub height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderStage {
+    Vertex,
+    Fragment,
+    Unknown(u32),
+}
+
+impl ShaderStage {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::Vertex,
+            1 => Self::Fragment,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ShaderFormat {
+    Wgsl,
+    Builtin,
+    Unknown(u32),
+}
+
+impl ShaderFormat {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            1 => Self::Wgsl,
+            2 => Self::Builtin,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum ColorFormat {
+    RgbU8,
+    RgbaU8,
+    Unknown(u32),
+}
+
+impl ColorFormat {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::RgbU8,
+            1 => Self::RgbaU8,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum TexCoordFormat {
+    None,
+    UvF32,
+    Unknown(u32),
+}
+
+impl TexCoordFormat {
+    pub fn from_raw(value: u32) -> Self {
+        match value {
+            0 => Self::None,
+            1 => Self::UvF32,
+            other => Self::Unknown(other),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ShaderResource {
+    pub id: u32,
+    pub stage: ShaderStage,
+    pub format: ShaderFormat,
+    pub source: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VertexLayoutDesc {
+    pub stride: u32,
+    pub pos_offset: u32,
+    pub color_offset: u32,
+    pub color_format: ColorFormat,
+    pub texcoord_offset: u32,
+    pub texcoord_format: TexCoordFormat,
+}
+
+#[derive(Clone, Debug)]
+pub struct PipelineResource {
+    pub id: u32,
+    pub vertex_layout: VertexLayoutDesc,
+    pub vs_shader_id: u32,
+    pub fs_shader_id: u32,
+}
+
 #[derive(Clone, Debug)]
 pub enum FrameCommand {
     SetBlend(BlendState),
@@ -163,6 +259,10 @@ pub enum FrameCommand {
         sample_kind: TextureSampleKind,
         vertices: Vec<TexVertex>,
     },
+    DrawPipeline {
+        pipeline_id: u32,
+        vertices: Vec<TexVertex>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -173,5 +273,7 @@ pub struct Frame {
     pub clear_rgb: u32,
     pub allow_present: bool,
     pub preserve_contents: bool,
+    pub shaders: HashMap<u32, ShaderResource>,
+    pub pipelines: HashMap<u32, PipelineResource>,
     pub commands: Vec<FrameCommand>,
 }

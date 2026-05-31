@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use crate::command::{
-    BlendState, Frame, FrameCommand, SamplerState, TextureEffect, TextureSampleKind,
+    BlendState, ColorFormat, Frame, FrameCommand, PipelineResource, SamplerState, ShaderFormat,
+    ShaderResource, ShaderStage, TextureEffect, TextureSampleKind, TexCoordFormat,
+    VertexLayoutDesc,
 };
 use crate::texture::TextureRegistry;
 use crate::vertex::{decode_rgb_vertices, decode_tex_vertices, usable_rgb_len, usable_tex_len};
@@ -38,6 +42,8 @@ pub struct Adapter {
     allow_present: bool,
     preserve_contents: bool,
     commands: Vec<FrameCommand>,
+    shaders: HashMap<u32, ShaderResource>,
+    pipelines: HashMap<u32, PipelineResource>,
     stats: FrameStats,
     last_frame: Option<Frame>,
 }
@@ -59,6 +65,8 @@ impl Adapter {
             allow_present: false,
             preserve_contents: false,
             commands: Vec::new(),
+            shaders: HashMap::new(),
+            pipelines: HashMap::new(),
             stats: FrameStats::default(),
             last_frame: None,
         }
@@ -115,6 +123,8 @@ impl Adapter {
             clear_rgb: self.clear_rgb,
             allow_present: self.allow_present,
             preserve_contents: self.preserve_contents,
+            shaders: self.shaders.clone(),
+            pipelines: self.pipelines.clone(),
             commands: core::mem::take(&mut self.commands),
         };
         self.stats.command_count = frame.commands.len().min(u32::MAX as usize) as u32;
@@ -200,6 +210,77 @@ impl Adapter {
         0
     }
 
+    pub fn create_shader_raw(
+        &mut self,
+        shader_id: u32,
+        stage: u32,
+        format: u32,
+        source: &[u8],
+    ) -> i32 {
+        if shader_id == 0 {
+            return -1;
+        }
+        let stage = ShaderStage::from_raw(stage);
+        let format = ShaderFormat::from_raw(format);
+        let Ok(source) = std::str::from_utf8(source) else {
+            return -2;
+        };
+        if !matches!(format, ShaderFormat::Wgsl) {
+            return -3;
+        }
+        self.shaders.insert(
+            shader_id,
+            ShaderResource {
+                id: shader_id,
+                stage,
+                format,
+                source: source.to_string(),
+            },
+        );
+        self.pipelines.retain(|_, pipeline| {
+            pipeline.vs_shader_id != shader_id && pipeline.fs_shader_id != shader_id
+        });
+        0
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_pipeline_raw(
+        &mut self,
+        pipeline_id: u32,
+        stride: u32,
+        pos_offset: u32,
+        color_offset: u32,
+        color_format: u32,
+        texcoord_offset: u32,
+        texcoord_format: u32,
+        vs_shader_id: u32,
+        fs_shader_id: u32,
+    ) -> i32 {
+        if pipeline_id == 0 || fs_shader_id == 0 {
+            return -1;
+        }
+        if !self.shaders.contains_key(&fs_shader_id) {
+            return -2;
+        }
+        self.pipelines.insert(
+            pipeline_id,
+            PipelineResource {
+                id: pipeline_id,
+                vertex_layout: VertexLayoutDesc {
+                    stride,
+                    pos_offset,
+                    color_offset,
+                    color_format: ColorFormat::from_raw(color_format),
+                    texcoord_offset,
+                    texcoord_format: TexCoordFormat::from_raw(texcoord_format),
+                },
+                vs_shader_id,
+                fs_shader_id,
+            },
+        );
+        0
+    }
+
     pub fn draw_rgb_triangles_no_present(&mut self, bytes: &[u8]) -> i32 {
         if bytes.is_empty() {
             return 0;
@@ -256,6 +337,35 @@ impl Adapter {
         self.commands.push(FrameCommand::DrawTex {
             tex_id,
             sample_kind,
+            vertices: decode_tex_vertices(&bytes[..usable]),
+        });
+        0
+    }
+
+    pub fn draw_pipeline_triangles_no_present(&mut self, pipeline_id: u32, bytes: &[u8]) -> i32 {
+        if pipeline_id == 0 {
+            return -1;
+        }
+        if bytes.is_empty() {
+            return 0;
+        }
+        let usable = usable_tex_len(bytes.len());
+        if usable == 0 {
+            return -3;
+        }
+        if !self.frame_active {
+            return -4;
+        }
+        if !self.pipelines.contains_key(&pipeline_id) {
+            return -5;
+        }
+        self.stats.tex_draws = self.stats.tex_draws.saturating_add(1);
+        self.stats.draw_bytes = self
+            .stats
+            .draw_bytes
+            .saturating_add(usable.min(u32::MAX as usize) as u32);
+        self.commands.push(FrameCommand::DrawPipeline {
+            pipeline_id,
             vertices: decode_tex_vertices(&bytes[..usable]),
         });
         0
