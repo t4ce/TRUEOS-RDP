@@ -6,7 +6,7 @@ use std::sync::{
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use adapterlibgfx::api::{Adapter, AdapterConfig};
 use adapterlibgfx::command::{ScissorRect, TextureSampleKind};
@@ -240,6 +240,7 @@ struct RdpViewer {
     frame_active: bool,
     active_frame_seq: u32,
     have_frame: bool,
+    startup_frame_presented: bool,
     asset_sync_active: bool,
     asset_sync_ready: bool,
     asset_sync_remaining: u32,
@@ -263,6 +264,7 @@ struct RdpViewer {
     logo_texture_ready: bool,
     logo_width: u32,
     logo_height: u32,
+    startup_started: Instant,
 }
 
 impl RdpViewer {
@@ -280,6 +282,7 @@ impl RdpViewer {
             frame_active: false,
             active_frame_seq: 0,
             have_frame: false,
+            startup_frame_presented: false,
             asset_sync_active: false,
             asset_sync_ready: false,
             asset_sync_remaining: 0,
@@ -303,6 +306,7 @@ impl RdpViewer {
             logo_texture_ready: false,
             logo_width: 0,
             logo_height: 0,
+            startup_started: Instant::now(),
         }
     }
 
@@ -377,11 +381,24 @@ impl RdpViewer {
                 &vertices,
             );
         }
-        draw_startup_field(
+        let status = if self.have_frame {
+            None
+        } else if self.connected && self.asset_sync_ready {
+            Some("connected - waiting for first frame")
+        } else if self.connected && self.asset_sync_active {
+            Some("connected - syncing assets")
+        } else if self.connected {
+            Some("connected")
+        } else {
+            self.last_error.as_deref()
+        };
+        draw_startup_panel(
             adapter,
             self.local_width,
             self.local_height,
-            &format!("cargo run -- {}", self.target_text),
+            &self.target_text,
+            status,
+            self.startup_started.elapsed(),
         );
         let _ = adapter.end_frame();
     }
@@ -425,7 +442,7 @@ impl RdpViewer {
                     self.frame_active = false;
                     self.active_frame_seq = 0;
                 }
-                let preserve = (flags & 1) != 0;
+                let preserve = (flags & 1) != 0 && self.have_frame;
                 let allow_present = (flags & 2) != 0;
                 let status = if preserve {
                     adapter.begin_frame_preserve(clear_rgb)
@@ -854,6 +871,12 @@ impl FrameProducer for RdpViewer {
     }
 
     fn build_frame(&mut self, adapter: &mut Adapter) {
+        if !self.startup_frame_presented {
+            self.draw_logo(adapter);
+            self.startup_frame_presented = true;
+            return;
+        }
+
         let mut drained = 0u32;
         while drained < 512 {
             match self.rx.try_recv() {
@@ -1416,63 +1439,257 @@ fn draw_clear_rect(adapter: &mut Adapter, rgb: u32, x: u32, y: u32, width: u32, 
     let _ = adapter.draw_rgb_triangles_no_present(&bytes);
 }
 
-fn draw_startup_field(adapter: &mut Adapter, width: u32, height: u32, text: &str) {
+fn draw_startup_panel(
+    adapter: &mut Adapter,
+    width: u32,
+    height: u32,
+    target: &str,
+    status: Option<&str>,
+    elapsed: Duration,
+) {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
-    let scale = if width < 720.0 { 2.0 } else { 3.0 };
-    let text_width = text.chars().count() as f32 * 6.0 * scale;
-    let field_width = (text_width + 48.0).clamp(320.0, (width - 32.0).max(160.0));
-    let field_height = (13.0 * scale + 24.0).clamp(42.0, 64.0);
-    let x0 = (width - field_width) * 0.5;
-    let y0 = (height - field_height) * 0.5;
-    let x1 = x0 + field_width;
-    let y1 = y0 + field_height;
+    let scale: f32 = if width < 720.0 { 2.0 } else { 3.0 };
+    let ui_scale = (width / 760.0).clamp(0.72, 1.25);
+    let (host, port) = split_target(target);
+    let ip_mode = looks_like_ip(host);
+
+    let panel_w = (730.0 * ui_scale).min(width - 24.0).max(360.0);
+    let panel_h = 188.0 * ui_scale;
+    let x0 = (width - panel_w) * 0.5;
+    let y0 = (height * 0.5 - panel_h * 0.58).clamp(18.0, (height - panel_h - 72.0).max(18.0));
+    let x1 = x0 + panel_w;
+    let y1 = y0 + panel_h;
+
+    let stroke = 3.0 * ui_scale;
+    let gap = 12.0 * ui_scale;
+    let pad = 30.0 * ui_scale;
+    let label_scale = (scale * 0.72).max(1.5);
+    let value_scale = (scale * 1.45).max(3.0);
+    let tab_scale = (scale * 1.35).max(3.0);
 
     let mut bytes = Vec::new();
+
+    push_px_rect(&mut bytes, width, height, x0, y0, x1, y1, 0x3267a8);
     push_px_rect(
         &mut bytes,
         width,
         height,
-        x0 - 3.0,
-        y0 - 3.0,
-        x1 + 3.0,
-        y1 + 3.0,
-        0x111a24,
-    );
-    push_px_rect(&mut bytes, width, height, x0, y0, x1, y1, 0xeaf2fb);
-    push_px_rect(
-        &mut bytes,
-        width,
-        height,
-        x0 + 3.0,
-        y0 + 3.0,
-        x1 - 3.0,
-        y1 - 3.0,
-        0x172532,
+        x0 + stroke,
+        y0 + stroke,
+        x1 - stroke,
+        y1 - stroke,
+        0xf8fbff,
     );
 
-    let visible = fit_ascii_text(
-        text,
-        ((field_width - 28.0) / (6.0 * scale)).max(1.0) as usize,
-    );
-    let visible_width = visible.chars().count() as f32 * 6.0 * scale;
-    let text_x = x0 + (field_width - visible_width) * 0.5;
-    let text_y = y0 + (field_height - 7.0 * scale) * 0.5;
+    let label_y = y0 + 10.0 * ui_scale;
+    let input_x0 = x0 + pad;
+    let input_y0 = y0 + 56.0 * ui_scale;
+    let input_h = 92.0 * ui_scale;
+    let tab_x0 = x0 + panel_w * 0.60;
+    let input_x1 = tab_x0 - gap;
+    let tab_w = x1 - pad - tab_x0;
+    let tab_mid = tab_x0 + tab_w * 0.34;
+    let tab_y1 = input_y0 + input_h;
+
     push_text(
         &mut bytes,
         width,
         height,
-        text_x + 1.0,
-        text_y + 1.0,
-        scale,
-        &visible,
-        0x000814,
+        input_x0,
+        label_y,
+        label_scale,
+        "TYPE",
+        0x111111,
     );
     push_text(
-        &mut bytes, width, height, text_x, text_y, scale, &visible, 0xf5fbff,
+        &mut bytes,
+        width,
+        height,
+        tab_x0,
+        label_y,
+        label_scale,
+        "TAB",
+        0x111111,
+    );
+
+    draw_stroked_box(
+        &mut bytes, width, height, input_x0, input_y0, input_x1, tab_y1, stroke, 0x3267a8, 0xffffff,
+    );
+    draw_stroked_box(
+        &mut bytes,
+        width,
+        height,
+        tab_x0,
+        input_y0,
+        x1 - pad,
+        tab_y1,
+        stroke,
+        0x3267a8,
+        0xffffff,
+    );
+    let selected_x0 = if ip_mode { tab_x0 + stroke } else { tab_mid };
+    let selected_x1 = if ip_mode { tab_mid } else { x1 - pad - stroke };
+    push_px_rect(
+        &mut bytes,
+        width,
+        height,
+        selected_x0,
+        input_y0 + stroke,
+        selected_x1,
+        tab_y1 - stroke,
+        0xb6cbe2,
+    );
+    push_px_rect(
+        &mut bytes,
+        width,
+        height,
+        tab_mid - stroke * 0.5,
+        input_y0,
+        tab_mid + stroke * 0.5,
+        tab_y1,
+        0x3267a8,
+    );
+
+    let host_visible = fit_ascii_text(
+        host,
+        ((input_x1 - input_x0 - 36.0 * ui_scale) / (6.0 * value_scale)).max(1.0) as usize,
+    );
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        input_x0 + 24.0 * ui_scale,
+        input_y0 + 33.0 * ui_scale,
+        value_scale,
+        &host_visible,
+        0x000000,
+    );
+    let port_label = format!("PORT {}", port.unwrap_or("100"));
+    let port_scale = (scale * 0.7).max(1.5);
+    let port_w = port_label.chars().count() as f32 * 6.0 * port_scale;
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        input_x1 - port_w - 10.0 * ui_scale,
+        tab_y1 - 27.0 * ui_scale,
+        port_scale,
+        &port_label,
+        0x000000,
+    );
+
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        tab_x0 + 25.0 * ui_scale,
+        input_y0 + 33.0 * ui_scale,
+        tab_scale,
+        "IP",
+        0x000000,
+    );
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        tab_mid + 28.0 * ui_scale,
+        input_y0 + 33.0 * ui_scale,
+        tab_scale,
+        "HOST",
+        0x000000,
+    );
+
+    let line = startup_status_line(status, elapsed);
+    let line_scale = (scale * 1.18).max(2.5);
+    let line_w = line.chars().count() as f32 * 6.0 * line_scale;
+    let line_x = (width - line_w) * 0.5;
+    let line_y = y1 + 18.0 * ui_scale;
+    push_text(
+        &mut bytes,
+        width,
+        height,
+        line_x + 1.0,
+        line_y + 1.0,
+        line_scale,
+        &line,
+        0xf8fbff,
+    );
+    push_text(
+        &mut bytes, width, height, line_x, line_y, line_scale, &line, 0x000000,
     );
 
     let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+}
+
+fn draw_stroked_box(
+    bytes: &mut Vec<u8>,
+    width: f32,
+    height: f32,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    stroke: f32,
+    border: u32,
+    fill: u32,
+) {
+    push_px_rect(bytes, width, height, x0, y0, x1, y1, border);
+    push_px_rect(
+        bytes,
+        width,
+        height,
+        x0 + stroke,
+        y0 + stroke,
+        x1 - stroke,
+        y1 - stroke,
+        fill,
+    );
+}
+
+fn split_target(target: &str) -> (&str, Option<&str>) {
+    let trimmed = target.trim();
+    let Some((host, port)) = trimmed.rsplit_once(':') else {
+        return (trimmed, None);
+    };
+    if port.chars().all(|ch| ch.is_ascii_digit()) {
+        (host, Some(port))
+    } else {
+        (trimmed, None)
+    }
+}
+
+fn looks_like_ip(host: &str) -> bool {
+    let mut parts = 0usize;
+    for part in host.split('.') {
+        if part.is_empty() || part.len() > 3 || !part.chars().all(|ch| ch.is_ascii_digit()) {
+            return false;
+        }
+        if part.parse::<u8>().is_err() {
+            return false;
+        }
+        parts += 1;
+    }
+    parts == 4
+}
+
+fn startup_status_line(status: Option<&str>, elapsed: Duration) -> String {
+    if let Some(status) = status {
+        if status.starts_with("connected") {
+            return status.to_string();
+        }
+    }
+    let phase = 3u64.saturating_sub(elapsed.as_secs() % 4);
+    if phase == 0 {
+        "Autoconnect ...".to_string()
+    } else {
+        format!(
+            "Autoconnect {} {} {} ...",
+            phase,
+            phase.saturating_sub(1),
+            phase.saturating_sub(2)
+        )
+    }
 }
 
 fn fit_ascii_text(text: &str, max_chars: usize) -> String {
@@ -1703,25 +1920,22 @@ fn logo_vertices(
     viewport_width: u32,
     viewport_height: u32,
 ) -> Vec<u8> {
-    let (u0, v0, u1, v1) = if logo_width == 0
-        || logo_height == 0
-        || viewport_width == 0
-        || viewport_height == 0
-    {
-        (0.0f32, 0.0f32, 1.0f32, 1.0f32)
-    } else {
-        let logo_aspect = logo_width as f32 / logo_height as f32;
-        let viewport_aspect = viewport_width as f32 / viewport_height as f32;
-        if logo_aspect > viewport_aspect {
-            let visible_u = (viewport_aspect / logo_aspect).clamp(0.0, 1.0);
-            let u0 = (1.0 - visible_u) * 0.5;
-            (u0, 0.0, 1.0 - u0, 1.0)
+    let (u0, v0, u1, v1) =
+        if logo_width == 0 || logo_height == 0 || viewport_width == 0 || viewport_height == 0 {
+            (0.0f32, 0.0f32, 1.0f32, 1.0f32)
         } else {
-            let visible_v = (logo_aspect / viewport_aspect).clamp(0.0, 1.0);
-            let v0 = (1.0 - visible_v) * 0.5;
-            (0.0, v0, 1.0, 1.0 - v0)
-        }
-    };
+            let logo_aspect = logo_width as f32 / logo_height as f32;
+            let viewport_aspect = viewport_width as f32 / viewport_height as f32;
+            if logo_aspect > viewport_aspect {
+                let visible_u = (viewport_aspect / logo_aspect).clamp(0.0, 1.0);
+                let u0 = (1.0 - visible_u) * 0.5;
+                (u0, 0.0, 1.0 - u0, 1.0)
+            } else {
+                let visible_v = (logo_aspect / viewport_aspect).clamp(0.0, 1.0);
+                let v0 = (1.0 - visible_v) * 0.5;
+                (0.0, v0, 1.0, 1.0 - v0)
+            }
+        };
     let vertices = [
         (-1.0f32, 1.0f32, u0, v0),
         (1.0f32, 1.0f32, u1, v0),
