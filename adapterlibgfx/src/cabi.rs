@@ -114,6 +114,17 @@ pub unsafe extern "C" fn trueos_cabi_gfx_clear_render_target() -> i32 {
 
 #[cfg(feature = "ffi")]
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn trueos_cabi_gfx_clear_rgba_no_present(
+    r: u32,
+    g: u32,
+    b: u32,
+    a: u32,
+) -> i32 {
+    ADAPTER.lock().clear_rgba_raw(r, g, b, a)
+}
+
+#[cfg(feature = "ffi")]
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn trueos_cabi_gfx_draw_rgb_triangles_no_present(
     vtx_ptr: *const u8,
     vtx_len: usize,

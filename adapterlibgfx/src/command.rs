@@ -251,6 +251,12 @@ pub enum FrameCommand {
     SetTextureEffect(TextureEffect),
     SetScissor(Option<ScissorRect>),
     SetRenderTarget(u32),
+    ClearRgba {
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    },
     DrawRgb {
         vertices: Vec<RgbVertex>,
     },

@@ -544,6 +544,11 @@ impl WgpuRenderer {
                     current_target = *tex_id;
                     self.scissor = None;
                 }
+                FrameCommand::ClearRgba { r, g, b, a } => {
+                    let view = self.target_view(current_target)?;
+                    self.clear_target_rgba(&mut encoder, &view, *r, *g, *b, *a);
+                    cleared_targets.insert(current_target);
+                }
                 FrameCommand::DrawRgb { vertices } => {
                     let view = self.target_view(current_target)?;
                     let format = self.target_format(current_target);
@@ -574,6 +579,9 @@ impl WgpuRenderer {
                     sample_kind,
                     vertices,
                 } => {
+                    if current_target != 0 && *tex_id == current_target {
+                        continue;
+                    }
                     let view = self.target_view(current_target)?;
                     let Some(source) = self.textures.get(tex_id) else {
                         return Err(RenderError::MissingTexture(*tex_id));
@@ -838,13 +846,28 @@ impl WgpuRenderer {
         view: &wgpu::TextureView,
         clear_rgb: u32,
     ) {
+        let r = ((clear_rgb >> 16) & 0xFF) as u8;
+        let g = ((clear_rgb >> 8) & 0xFF) as u8;
+        let b = (clear_rgb & 0xFF) as u8;
+        self.clear_target_rgba(encoder, view, r, g, b, 255);
+    }
+
+    fn clear_target_rgba(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    ) {
         let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("adapterlibgfx-clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color(clear_rgb)),
+                    load: wgpu::LoadOp::Clear(clear_color_rgba(r, g, b, a)),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1332,6 +1355,11 @@ impl WgpuHeadlessRenderer {
                     current_target = *tex_id;
                     self.scissor = None;
                 }
+                FrameCommand::ClearRgba { r, g, b, a } => {
+                    let view = self.target_view(current_target)?;
+                    self.clear_target_rgba(&mut encoder, &view, *r, *g, *b, *a);
+                    cleared_targets.insert(current_target);
+                }
                 FrameCommand::DrawRgb { vertices } => {
                     let view = self.target_view(current_target)?;
                     let format = self.target_format(current_target);
@@ -1348,6 +1376,9 @@ impl WgpuHeadlessRenderer {
                     sample_kind,
                     vertices,
                 } => {
+                    if current_target != 0 && *tex_id == current_target {
+                        continue;
+                    }
                     let view = self.target_view(current_target)?;
                     let Some(source) = self.textures.get(tex_id) else {
                         return Err(RenderError::MissingTexture(*tex_id));
@@ -1537,13 +1568,28 @@ impl WgpuHeadlessRenderer {
         view: &wgpu::TextureView,
         clear_rgb: u32,
     ) {
+        let r = ((clear_rgb >> 16) & 0xFF) as u8;
+        let g = ((clear_rgb >> 8) & 0xFF) as u8;
+        let b = (clear_rgb & 0xFF) as u8;
+        self.clear_target_rgba(encoder, view, r, g, b, 255);
+    }
+
+    fn clear_target_rgba(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        view: &wgpu::TextureView,
+        r: u8,
+        g: u8,
+        b: u8,
+        a: u8,
+    ) {
         let _pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("adapterlibgfx-headless-clear"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color(clear_rgb)),
+                    load: wgpu::LoadOp::Clear(clear_color_rgba(r, g, b, a)),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -1803,11 +1849,20 @@ fn create_render_copy_target(
 }
 
 fn clear_color(rgb: u32) -> wgpu::Color {
+    clear_color_rgba(
+        ((rgb >> 16) & 0xFF) as u8,
+        ((rgb >> 8) & 0xFF) as u8,
+        (rgb & 0xFF) as u8,
+        255,
+    )
+}
+
+fn clear_color_rgba(r: u8, g: u8, b: u8, a: u8) -> wgpu::Color {
     wgpu::Color {
-        r: ((rgb >> 16) & 0xFF) as f64 / 255.0,
-        g: ((rgb >> 8) & 0xFF) as f64 / 255.0,
-        b: (rgb & 0xFF) as f64 / 255.0,
-        a: 1.0,
+        r: f64::from(r) / 255.0,
+        g: f64::from(g) / 255.0,
+        b: f64::from(b) / 255.0,
+        a: f64::from(a) / 255.0,
     }
 }
 

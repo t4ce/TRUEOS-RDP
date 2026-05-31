@@ -37,6 +37,7 @@ fn log_render_shape(frame: &Frame) {
             }
             FrameCommand::DrawRgb { .. } => offscreen_rgb = offscreen_rgb.saturating_add(1),
             FrameCommand::DrawTex { .. } => offscreen_tex = offscreen_tex.saturating_add(1),
+            FrameCommand::ClearRgba { .. } => {}
             _ => {}
         }
     }

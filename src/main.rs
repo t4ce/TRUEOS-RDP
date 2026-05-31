@@ -110,6 +110,7 @@ const MSG_RESOURCE_SNAPSHOT_END: u16 = 18;
 const MSG_SHADER_CREATE: u16 = 19;
 const MSG_PIPELINE_CREATE: u16 = 20;
 const MSG_DRAW_PIPELINE_TRIANGLES: u16 = 21;
+const MSG_CLEAR_COLOR_RGBA: u16 = 22;
 const MSG_INPUT_TABLET_ABS: u16 = 100;
 const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const MSG_CLIENT_RECOMPOSE: u16 = 102;
@@ -178,6 +179,13 @@ enum RdpMessage {
         y: u32,
         width: u32,
         height: u32,
+    },
+    ClearColorRgba {
+        seq: u32,
+        r: u32,
+        g: u32,
+        b: u32,
+        a: u32,
     },
     TextureRgba {
         tex_id: u32,
@@ -419,6 +427,7 @@ impl RdpViewer {
                 FrameCommand::DrawPipeline { .. } => {
                     offscreen_tex = offscreen_tex.saturating_add(1)
                 }
+                FrameCommand::ClearRgba { .. } => {}
                 _ => {}
             }
         }
@@ -532,14 +541,14 @@ impl RdpViewer {
                     self.frame_active = false;
                     self.active_frame_seq = 0;
                 }
-                let preserve = (flags & 1) != 0 && self.have_frame;
+                let preserve_requested = (flags & 1) != 0;
                 let allow_present = (flags & 2) != 0;
-                let status = if preserve {
-                    adapter.begin_frame_preserve(clear_rgb)
-                } else if allow_present {
-                    adapter.begin_frame(clear_rgb)
-                } else {
-                    adapter.begin_frame_no_present(clear_rgb)
+                let preserve = preserve_requested && (!allow_present || self.have_frame);
+                let status = match (preserve, allow_present) {
+                    (true, true) => adapter.begin_frame_preserve(clear_rgb),
+                    (true, false) => adapter.begin_frame_preserve_no_present(clear_rgb),
+                    (false, true) => adapter.begin_frame(clear_rgb),
+                    (false, false) => adapter.begin_frame_no_present(clear_rgb),
                 };
                 self.frame_active = status == 0;
                 self.active_frame_seq = if status == 0 { seq } else { 0 };
@@ -561,7 +570,9 @@ impl RdpViewer {
                 if self.frame_seq_active(seq) {
                     if let Ok(frame) = adapter.end_frame() {
                         self.log_frame_shape(&frame);
-                        self.have_frame = true;
+                        if frame.allow_present {
+                            self.have_frame = true;
+                        }
                         self.frames = self.frames.saturating_add(1);
                         if should_log_count(self.frames) {
                             log_info!(
@@ -633,7 +644,12 @@ impl RdpViewer {
                 if self.frame_seq_active(seq) {
                     let rc = adapter.set_render_target(tex_id);
                     if rc != 0 {
-                        log_warn!("set_render_target failed seq={} tex={} rc={}", seq, tex_id, rc);
+                        log_warn!(
+                            "set_render_target failed seq={} tex={} rc={}",
+                            seq,
+                            tex_id,
+                            rc
+                        );
                     }
                 }
             }
@@ -652,6 +668,11 @@ impl RdpViewer {
             } => {
                 if self.frame_seq_active(seq) {
                     draw_clear_rect(adapter, rgb, x, y, width, height);
+                }
+            }
+            RdpMessage::ClearColorRgba { seq, r, g, b, a } => {
+                if self.frame_seq_active(seq) {
+                    let _ = adapter.clear_rgba_raw(r, g, b, a);
                 }
             }
             RdpMessage::TextureRgba {
@@ -1465,6 +1486,13 @@ fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
             width: f(4),
             height: f(5),
         },
+        MSG_CLEAR_COLOR_RGBA => RdpMessage::ClearColorRgba {
+            seq: f(0),
+            r: f(1),
+            g: f(2),
+            b: f(3),
+            a: f(4),
+        },
         MSG_TEXTURE_RGBA => {
             let region = if f(6) != 0 && f(7) != 0 {
                 Some((f(4), f(5), f(6), f(7)))
@@ -1582,6 +1610,7 @@ fn field_count(msg: u16) -> Result<usize, String> {
         MSG_SET_RENDER_TARGET => Ok(2),
         MSG_CLEAR_RENDER_TARGET => Ok(1),
         MSG_CLEAR_RECT => Ok(6),
+        MSG_CLEAR_COLOR_RGBA => Ok(5),
         MSG_TEXTURE_RGBA => Ok(9),
         MSG_TEXTURE_PNG | MSG_TEXTURE_JPEG | MSG_TEXTURE_SVG => Ok(3),
         MSG_DRAW_RGB_TRIANGLES => Ok(3),
@@ -1790,9 +1819,7 @@ fn draw_startup_panel(
     let input_w = base_content_w * 0.43;
     let tab_w = base_content_w * 0.22;
     let row_w = input_w + gap + tab_w;
-    let panel_w = (row_w + 2.0 * (gap + stroke))
-        .min(width - 24.0)
-        .max(360.0);
+    let panel_w = (row_w + 2.0 * (gap + stroke)).min(width - 24.0).max(360.0);
     let panel_h = pad + input_h + gap + stroke;
     let x0 = (width - panel_w) * 0.5;
     let y0 = pad.min((height - panel_h - 72.0).max(18.0));
@@ -1843,7 +1870,16 @@ fn draw_startup_panel(
     );
 
     draw_stroked_box(
-        &mut bytes, width, height, input_x0, input_y0, input_x1, tab_y1, stroke, border_color, 0xffffff,
+        &mut bytes,
+        width,
+        height,
+        input_x0,
+        input_y0,
+        input_x1,
+        tab_y1,
+        stroke,
+        border_color,
+        0xffffff,
     );
     draw_stroked_box(
         &mut bytes,
@@ -2024,9 +2060,7 @@ fn startup_tab_hit(width: u32, height: u32, x: f32, y: f32) -> Option<bool> {
     let input_w = base_content_w * 0.43;
     let tab_w = base_content_w * 0.22;
     let row_w = input_w + gap + tab_w;
-    let panel_w = (row_w + 2.0 * (gap + stroke))
-        .min(width - 24.0)
-        .max(360.0);
+    let panel_w = (row_w + 2.0 * (gap + stroke)).min(width - 24.0).max(360.0);
     let panel_h = pad + input_h + gap + stroke;
     let x0 = (width - panel_w) * 0.5;
     let y0 = pad.min((height - panel_h - 72.0).max(18.0));

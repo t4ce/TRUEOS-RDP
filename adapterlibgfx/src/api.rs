@@ -89,6 +89,10 @@ impl Adapter {
         self.begin_frame_inner(clear_rgb, true, true)
     }
 
+    pub fn begin_frame_preserve_no_present(&mut self, clear_rgb: u32) -> i32 {
+        self.begin_frame_inner(clear_rgb, true, false)
+    }
+
     fn begin_frame_inner(
         &mut self,
         clear_rgb: u32,
@@ -206,6 +210,18 @@ impl Adapter {
         if self.frame_active {
             self.commands.push(FrameCommand::SetScissor(None));
             self.commands.push(FrameCommand::SetRenderTarget(tex_id));
+        }
+        0
+    }
+
+    pub fn clear_rgba_raw(&mut self, r: u32, g: u32, b: u32, a: u32) -> i32 {
+        if self.frame_active {
+            self.commands.push(FrameCommand::ClearRgba {
+                r: r.min(255) as u8,
+                g: g.min(255) as u8,
+                b: b.min(255) as u8,
+                a: a.min(255) as u8,
+            });
         }
         0
     }
