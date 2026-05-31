@@ -1,0 +1,15 @@
+[package]
+name = "trueos-rdp"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+shaderson = ["adapterlibgfx/shaderson"]
+
+[dependencies]
+adapterlibgfx = { path = "adapterlibgfx", default-features = false }
+png = { version = "0.18.1", default-features = false }
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["x86"] }
