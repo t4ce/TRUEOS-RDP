@@ -254,6 +254,10 @@ pub struct WgpuRenderer {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    screen_texture: wgpu::Texture,
+    screen_view: wgpu::TextureView,
+    screen_width: u32,
+    screen_height: u32,
     shader: wgpu::ShaderModule,
     started_at: Instant,
     frame_layout: wgpu::BindGroupLayout,
@@ -322,8 +326,10 @@ impl WgpuRenderer {
         let mut config = surface
             .get_default_config(&adapter, width, height)
             .ok_or(RenderError::AdapterUnavailable)?;
-        config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST;
         surface.configure(&device, &config);
+        let (screen_texture, screen_view) =
+            create_screen_target(&device, width, height, config.format);
 
         let shader_source = [SHADER_COMMON, SHADER_TEX_FRAGMENT].concat();
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -371,6 +377,10 @@ impl WgpuRenderer {
             device,
             queue,
             config,
+            screen_texture,
+            screen_view,
+            screen_width: width,
+            screen_height: height,
             shader,
             started_at: Instant::now(),
             frame_layout,
@@ -394,9 +404,51 @@ impl WgpuRenderer {
         if self.config.width == width && self.config.height == height {
             return;
         }
+        let old_screen_texture = core::mem::replace(
+            &mut self.screen_texture,
+            create_screen_target(&self.device, 1, 1, self.config.format).0,
+        );
+        let old_screen_width = self.screen_width;
+        let old_screen_height = self.screen_height;
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        let (screen_texture, screen_view) =
+            create_screen_target(&self.device, width, height, self.config.format);
+        self.screen_texture = screen_texture;
+        self.screen_view = screen_view;
+        self.screen_width = width;
+        self.screen_height = height;
+
+        let copy_width = old_screen_width.min(width);
+        let copy_height = old_screen_height.min(height);
+        if copy_width != 0 && copy_height != 0 {
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("adapterlibgfx-resize-preserve"),
+                });
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &old_screen_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.screen_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: copy_width,
+                    height: copy_height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit(Some(encoder.finish()));
+        }
     }
 
     pub fn render_frame(
@@ -422,12 +474,6 @@ impl WgpuRenderer {
         } else {
             None
         };
-        let surface_view = surface_texture.as_ref().map(|texture| {
-            texture
-                .texture
-                .create_view(&wgpu::TextureViewDescriptor::default())
-        });
-
         self.sampler = SamplerState::default();
         self.texture_effect = TextureEffect::default();
         self.blend = BlendState::default();
@@ -463,8 +509,9 @@ impl WgpuRenderer {
         let mut cleared_targets = HashSet::new();
 
         if frame.commands.is_empty() && frame.allow_present {
-            if let Some(view) = surface_view.as_ref() {
-                self.clear_target(&mut encoder, view, frame.clear_rgb);
+            if !frame.preserve_contents {
+                let view = self.screen_view.clone();
+                self.clear_target(&mut encoder, &view, frame.clear_rgb);
             }
         }
 
@@ -485,10 +532,7 @@ impl WgpuRenderer {
                     self.scissor = None;
                 }
                 FrameCommand::DrawRgb { vertices } => {
-                    let Some(view) = self.target_view(current_target, surface_view.as_ref())?
-                    else {
-                        continue;
-                    };
+                    let view = self.target_view(current_target)?;
                     let format = self.target_format(current_target);
                     let load = self.load_op_for_target(&mut cleared_targets, current_target, frame);
                     if current_target == 0 {
@@ -517,10 +561,7 @@ impl WgpuRenderer {
                     sample_kind,
                     vertices,
                 } => {
-                    let Some(view) = self.target_view(current_target, surface_view.as_ref())?
-                    else {
-                        continue;
-                    };
+                    let view = self.target_view(current_target)?;
                     let Some(source) = self.textures.get(tex_id) else {
                         return Err(RenderError::MissingTexture(*tex_id));
                     };
@@ -555,6 +596,27 @@ impl WgpuRenderer {
             }
         }
 
+        if let Some(texture) = surface_texture.as_ref() {
+            encoder.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.screen_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d {
+                    width: self.screen_width.min(self.config.width),
+                    height: self.screen_height.min(self.config.height),
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
         self.queue.submit(Some(encoder.finish()));
         if let Some(texture) = surface_texture {
             texture.present();
@@ -627,17 +689,13 @@ impl WgpuRenderer {
         }
     }
 
-    fn target_view(
-        &self,
-        tex_id: u32,
-        surface_view: Option<&wgpu::TextureView>,
-    ) -> Result<Option<wgpu::TextureView>, RenderError> {
+    fn target_view(&self, tex_id: u32) -> Result<wgpu::TextureView, RenderError> {
         if tex_id == 0 {
-            Ok(surface_view.cloned())
+            Ok(self.screen_view.clone())
         } else {
             self.textures
                 .get(&tex_id)
-                .map(|texture| Some(texture.view.clone()))
+                .map(|texture| texture.view.clone())
                 .ok_or(RenderError::InvalidTarget(tex_id))
         }
     }
@@ -1522,8 +1580,27 @@ fn create_headless_target(
     height: u32,
     format: wgpu::TextureFormat,
 ) -> (wgpu::Texture, wgpu::TextureView) {
+    create_render_copy_target(device, width, height, format, "adapterlibgfx-headless-target")
+}
+
+fn create_screen_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    create_render_copy_target(device, width, height, format, "adapterlibgfx-screen-target")
+}
+
+fn create_render_copy_target(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    format: wgpu::TextureFormat,
+    label: &'static str,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let target = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("adapterlibgfx-headless-target"),
+        label: Some(label),
         size: wgpu::Extent3d {
             width,
             height,
@@ -1533,7 +1610,9 @@ fn create_headless_target(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
         view_formats: &[],
     });
     let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());

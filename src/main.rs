@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use adapterlibgfx::api::{Adapter, AdapterConfig};
-use adapterlibgfx::command::{ScissorRect, TextureSampleKind};
+use adapterlibgfx::command::{Frame, FrameCommand, ScissorRect, TextureSampleKind};
 use adapterlibgfx::window::{
     FrameProducer, InputButtonState, InputEvent, InputMouseButton, WgpuWindowApp,
 };
@@ -22,6 +22,7 @@ const PROTOCOL_VERSION: u16 = 1;
 const DEFAULT_ADDR: &str = "trueos.eu:100";
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
+const RESIZE_RECOMPOSE_SETTLE_DELAY: Duration = Duration::from_millis(160);
 const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
 const DETAILED_LOG_LIMIT: u64 = 16;
 
@@ -107,6 +108,7 @@ const MSG_RESOURCE_SNAPSHOT_BEGIN: u16 = 17;
 const MSG_RESOURCE_SNAPSHOT_END: u16 = 18;
 const MSG_INPUT_TABLET_ABS: u16 = 100;
 const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
+const MSG_CLIENT_RECOMPOSE: u16 = 102;
 const INPUT_FLAG_MOTION: u32 = 1 << 0;
 const INPUT_FLAG_WHEEL: u32 = 1 << 1;
 const INPUT_FLAG_BUTTONS: u32 = 1 << 2;
@@ -214,6 +216,7 @@ enum RdpMessage {
 enum RdpInput {
     Tablet(RdpTabletInput),
     Keyboard(RdpKeyboardInput),
+    Recompose(RdpRecomposeInput),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -229,6 +232,12 @@ struct RdpTabletInput {
 struct RdpKeyboardInput {
     modifiers: u8,
     keys: [u8; 6],
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RdpRecomposeInput {
+    width: u32,
+    height: u32,
 }
 
 struct RdpViewer {
@@ -261,6 +270,7 @@ struct RdpViewer {
     buttons_down: u32,
     keyboard_modifiers: u8,
     keyboard_keys: [u8; 6],
+    resize_recompose_due: Option<Instant>,
     logo_texture_ready: bool,
     logo_width: u32,
     logo_height: u32,
@@ -303,6 +313,7 @@ impl RdpViewer {
             buttons_down: 0,
             keyboard_modifiers: 0,
             keyboard_keys: [0; 6],
+            resize_recompose_due: None,
             logo_texture_ready: false,
             logo_width: 0,
             logo_height: 0,
@@ -346,6 +357,49 @@ impl RdpViewer {
         if !self.asset_sync_active && self.asset_sync_remaining == 0 {
             self.asset_sync_ready = true;
         }
+    }
+
+    fn log_frame_shape(&self, frame: &Frame) {
+        if !should_log_count(self.frames.saturating_add(1)) {
+            return;
+        }
+        let mut target = 0u32;
+        let mut screen_rgb = 0u32;
+        let mut screen_tex = 0u32;
+        let mut offscreen_rgb = 0u32;
+        let mut offscreen_tex = 0u32;
+        let mut target_sets = 0u32;
+        for command in &frame.commands {
+            match command {
+                FrameCommand::SetRenderTarget(tex_id) => {
+                    target = *tex_id;
+                    target_sets = target_sets.saturating_add(1);
+                }
+                FrameCommand::DrawRgb { .. } if target == 0 => {
+                    screen_rgb = screen_rgb.saturating_add(1)
+                }
+                FrameCommand::DrawTex { .. } if target == 0 => {
+                    screen_tex = screen_tex.saturating_add(1)
+                }
+                FrameCommand::DrawRgb { .. } => offscreen_rgb = offscreen_rgb.saturating_add(1),
+                FrameCommand::DrawTex { .. } => offscreen_tex = offscreen_tex.saturating_add(1),
+                _ => {}
+            }
+        }
+        log_info!(
+            "frame_shape seq={} cmds={} present={} preserve={} clear=0x{:06x} targets={} final_target={} screen_rgb={} screen_tex={} offscreen_rgb={} offscreen_tex={}",
+            frame.seq,
+            frame.commands.len(),
+            frame.allow_present as u8,
+            frame.preserve_contents as u8,
+            frame.clear_rgb & 0x00ff_ffff,
+            target_sets,
+            target,
+            screen_rgb,
+            screen_tex,
+            offscreen_rgb,
+            offscreen_tex
+        );
     }
 
     fn draw_logo(&mut self, adapter: &mut Adapter) {
@@ -469,7 +523,8 @@ impl RdpViewer {
                     return;
                 }
                 if self.frame_seq_active(seq) {
-                    if adapter.end_frame().is_ok() {
+                    if let Ok(frame) = adapter.end_frame() {
+                        self.log_frame_shape(&frame);
                         self.have_frame = true;
                         self.frames = self.frames.saturating_add(1);
                         if should_log_count(self.frames) {
@@ -540,7 +595,10 @@ impl RdpViewer {
             }
             RdpMessage::SetRenderTarget { seq, tex_id } => {
                 if self.frame_seq_active(seq) {
-                    let _ = adapter.set_render_target(tex_id);
+                    let rc = adapter.set_render_target(tex_id);
+                    if rc != 0 {
+                        log_warn!("set_render_target failed seq={} tex={} rc={}", seq, tex_id, rc);
+                    }
                 }
             }
             RdpMessage::ClearRenderTarget { seq } => {
@@ -694,11 +752,21 @@ impl RdpViewer {
             } => {
                 if self.frame_seq_active(seq) {
                     apply_sampler_flags(adapter, sampler_flags);
-                    let _ = adapter.draw_tex_triangles_sample_kind_no_present(
+                    let rc = adapter.draw_tex_triangles_sample_kind_no_present(
                         tex_id,
                         sample_kind,
                         &bytes,
                     );
+                    if rc != 0 {
+                        log_warn!(
+                            "draw_tex failed seq={} tex={} rc={} sample={:?} bytes={}",
+                            seq,
+                            tex_id,
+                            rc,
+                            sample_kind,
+                            bytes.len()
+                        );
+                    }
                 }
                 self.tex_draws = self.tex_draws.saturating_add(1);
                 self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
@@ -757,6 +825,13 @@ impl RdpViewer {
         }));
     }
 
+    fn emit_recompose_request(&self) {
+        let _ = self.input_tx.send(RdpInput::Recompose(RdpRecomposeInput {
+            width: self.local_width,
+            height: self.local_height,
+        }));
+    }
+
     fn update_keyboard(&mut self, hid_keycode: u8, state: InputButtonState) {
         if (0xE0..=0xE7).contains(&hid_keycode) {
             let bit = 1u8 << (hid_keycode - 0xE0);
@@ -809,6 +884,7 @@ impl FrameProducer for RdpViewer {
     fn resize(&mut self, width: u32, height: u32) {
         self.local_width = width.max(1);
         self.local_height = height.max(1);
+        self.resize_recompose_due = Some(Instant::now() + RESIZE_RECOMPOSE_SETTLE_DELAY);
     }
 
     fn handle_input(&mut self, event: InputEvent) {
@@ -892,6 +968,13 @@ impl FrameProducer for RdpViewer {
             }
         }
         self.pending_messages = self.pending_messages.saturating_add(drained as u64);
+
+        if let Some(due) = self.resize_recompose_due {
+            if Instant::now() >= due {
+                self.emit_recompose_request();
+                self.resize_recompose_due = None;
+            }
+        }
 
         if !self.have_frame && !self.frame_active {
             self.draw_logo(adapter);
@@ -1083,6 +1166,7 @@ fn encode_input_frame(input: RdpInput) -> Vec<u8> {
     match input {
         RdpInput::Tablet(input) => encode_tablet_input_frame(input),
         RdpInput::Keyboard(input) => encode_keyboard_input_frame(input),
+        RdpInput::Recompose(input) => encode_recompose_input_frame(input),
     }
 }
 
@@ -1114,6 +1198,21 @@ fn encode_keyboard_input_frame(input: RdpKeyboardInput) -> Vec<u8> {
     payload.extend_from_slice(&(input.modifiers as u32).to_le_bytes());
     payload.extend_from_slice(&keys_lo.to_le_bytes());
     payload.extend_from_slice(&keys_hi.to_le_bytes());
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload.as_slice());
+    frame
+}
+
+fn encode_recompose_input_frame(input: RdpRecomposeInput) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8 + 12);
+    payload.extend_from_slice(b"TRDP");
+    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    payload.extend_from_slice(&MSG_CLIENT_RECOMPOSE.to_le_bytes());
+    payload.extend_from_slice(&input.width.to_le_bytes());
+    payload.extend_from_slice(&input.height.to_le_bytes());
+    payload.extend_from_slice(&0u32.to_le_bytes());
 
     let mut frame = Vec::with_capacity(4 + payload.len());
     frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
