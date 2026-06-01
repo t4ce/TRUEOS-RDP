@@ -114,6 +114,7 @@ const MSG_CLEAR_COLOR_RGBA: u16 = 22;
 const MSG_INPUT_TABLET_ABS: u16 = 100;
 const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const MSG_CLIENT_RECOMPOSE: u16 = 102;
+const MSG_RESOURCE_SNAPSHOT_ACK: u16 = 103;
 const INPUT_FLAG_MOTION: u32 = 1 << 0;
 const INPUT_FLAG_WHEEL: u32 = 1 << 1;
 const INPUT_FLAG_BUTTONS: u32 = 1 << 2;
@@ -141,6 +142,7 @@ enum RdpMessage {
     },
     EndFrame {
         seq: u32,
+        flags: u32,
     },
     SetBlend {
         seq: u32,
@@ -252,6 +254,7 @@ enum RdpInput {
     Tablet(RdpTabletInput),
     Keyboard(RdpKeyboardInput),
     Recompose(RdpRecomposeInput),
+    SnapshotAck,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -562,12 +565,13 @@ impl RdpViewer {
                     );
                 }
             }
-            RdpMessage::EndFrame { seq } => {
+            RdpMessage::EndFrame { seq, flags } => {
                 if self.dropping_frame_depth > 0 {
                     self.dropping_frame_depth = self.dropping_frame_depth.saturating_sub(1);
                     return;
                 }
                 if self.frame_seq_active(seq) {
+                    adapter.override_active_frame_mode((flags & 2) != 0, (flags & 1) != 0);
                     if let Ok(frame) = adapter.end_frame() {
                         self.log_frame_shape(&frame);
                         if frame.allow_present {
@@ -958,6 +962,9 @@ impl RdpViewer {
                     self.asset_sync_ready,
                     self.asset_sync_remaining
                 );
+                if self.asset_sync_ready {
+                    let _ = self.input_tx.send(RdpInput::SnapshotAck);
+                }
             }
         }
     }
@@ -1361,6 +1368,7 @@ fn encode_input_frame(input: RdpInput) -> Vec<u8> {
         RdpInput::Tablet(input) => encode_tablet_input_frame(input),
         RdpInput::Keyboard(input) => encode_keyboard_input_frame(input),
         RdpInput::Recompose(input) => encode_recompose_input_frame(input),
+        RdpInput::SnapshotAck => encode_snapshot_ack_input_frame(),
     }
 }
 
@@ -1414,6 +1422,18 @@ fn encode_recompose_input_frame(input: RdpRecomposeInput) -> Vec<u8> {
     frame
 }
 
+fn encode_snapshot_ack_input_frame() -> Vec<u8> {
+    let mut payload = Vec::with_capacity(8);
+    payload.extend_from_slice(b"TRDP");
+    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
+    payload.extend_from_slice(&MSG_RESOURCE_SNAPSHOT_ACK.to_le_bytes());
+
+    let mut frame = Vec::with_capacity(4 + payload.len());
+    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    frame.extend_from_slice(payload.as_slice());
+    frame
+}
+
 fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
     if payload.len() < 8 {
         return Err("short rdp payload".to_string());
@@ -1451,7 +1471,10 @@ fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
             flags: f(1),
             clear_rgb: f(2),
         },
-        MSG_END_FRAME => RdpMessage::EndFrame { seq: f(0) },
+        MSG_END_FRAME => RdpMessage::EndFrame {
+            seq: f(0),
+            flags: f(1),
+        },
         MSG_SET_BLEND => RdpMessage::SetBlend {
             seq: f(0),
             enabled: f(1),

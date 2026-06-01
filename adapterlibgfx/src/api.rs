@@ -115,6 +115,13 @@ impl Adapter {
         0
     }
 
+    pub fn override_active_frame_mode(&mut self, preserve_contents: bool, allow_present: bool) {
+        if self.frame_active {
+            self.preserve_contents = preserve_contents;
+            self.allow_present = allow_present;
+        }
+    }
+
     pub fn end_frame(&mut self) -> Result<Frame, i32> {
         if !self.frame_active {
             return Err(-1);
