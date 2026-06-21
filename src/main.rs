@@ -1,12 +1,13 @@
 use std::env;
 use std::io::{self, Cursor, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{
     Arc, Mutex, OnceLock,
+    atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use adapterlibgfx::api::{Adapter, AdapterConfig};
 use adapterlibgfx::command::{Frame, FrameCommand, ScissorRect, TextureSampleKind};
@@ -19,7 +20,7 @@ use zune_core::options::DecoderOptions;
 use zune_jpeg::JpegDecoder;
 
 const PROTOCOL_VERSION: u16 = 1;
-const DEFAULT_ADDR: &str = "trueos.eu:100";
+const DEFAULT_ADDR: &str = "192.168.178.94:100";
 const FIXED_RDP_PORT: &str = "100";
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -111,13 +112,16 @@ const MSG_SHADER_CREATE: u16 = 19;
 const MSG_PIPELINE_CREATE: u16 = 20;
 const MSG_DRAW_PIPELINE_TRIANGLES: u16 = 21;
 const MSG_CLEAR_COLOR_RGBA: u16 = 22;
-const MSG_INPUT_TABLET_ABS: u16 = 100;
-const MSG_INPUT_KEYBOARD_BOOT: u16 = 101;
 const MSG_CLIENT_RECOMPOSE: u16 = 102;
 const MSG_RESOURCE_SNAPSHOT_ACK: u16 = 103;
-const INPUT_FLAG_MOTION: u32 = 1 << 0;
-const INPUT_FLAG_WHEEL: u32 = 1 << 1;
-const INPUT_FLAG_BUTTONS: u32 = 1 << 2;
+const HID_UDP_MAGIC: &[u8; 4] = b"THID";
+const HID_UDP_VERSION: u8 = 1;
+const HID_UDP_KIND_KEYBOARD: u8 = 2;
+const HID_UDP_KIND_TABLET: u8 = 3;
+const HID_UDP_DEVICE_ID: u16 = 1;
+const INPUT_FLAG_MOTION: u16 = 1 << 0;
+const INPUT_FLAG_WHEEL: u16 = 1 << 1;
+const INPUT_FLAG_BUTTONS: u16 = 1 << 2;
 const LOGO_TEX_ID: u32 = 0xFFFF_FFFE;
 const LOGO_JPEG: &[u8] = include_bytes!("../logo.jpg");
 
@@ -259,11 +263,11 @@ enum RdpInput {
 
 #[derive(Clone, Copy, Debug)]
 struct RdpTabletInput {
-    slot_id: u32,
     x_q16: u32,
     y_q16: u32,
     buttons_down: u32,
-    flags: u32,
+    wheel: i16,
+    flags: u16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -283,6 +287,7 @@ struct RdpViewer {
     input_tx: Sender<RdpInput>,
     target: Arc<Mutex<String>>,
     target_text: String,
+    no_view: bool,
     connected: bool,
     frame_active: bool,
     active_frame_seq: u32,
@@ -317,18 +322,27 @@ struct RdpViewer {
 }
 
 impl RdpViewer {
-    fn new(rx: Receiver<RdpEvent>, input_tx: Sender<RdpInput>, target: Arc<Mutex<String>>) -> Self {
+    fn new(
+        rx: Receiver<RdpEvent>,
+        input_tx: Sender<RdpInput>,
+        target: Arc<Mutex<String>>,
+        no_view: bool,
+    ) -> Self {
         let target_text = target
             .lock()
             .map(|target| target.clone())
             .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
         let startup_host_mode = !looks_like_ip(split_target(&target_text).0);
+        if no_view {
+            log_info!("noview input armed target={}", target_text);
+        }
         Self {
             rx,
             input_tx,
             target,
             target_text,
-            connected: false,
+            no_view,
+            connected: no_view,
             frame_active: false,
             active_frame_seq: 0,
             have_frame: false,
@@ -467,7 +481,11 @@ impl RdpViewer {
             }
         }
 
-        let bg = if self.connected { 0x102030 } else { 0x281820 };
+        let bg = if self.connected || self.no_view {
+            0x102030
+        } else {
+            0x281820
+        };
         let _ = adapter.begin_frame(bg);
         if self.logo_texture_ready {
             let vertices = logo_vertices(
@@ -483,6 +501,11 @@ impl RdpViewer {
                 &vertices,
             );
         }
+        if self.no_view {
+            let _ = adapter.end_frame();
+            return;
+        }
+
         let status = if self.have_frame {
             None
         } else if self.connected && self.asset_sync_ready {
@@ -969,15 +992,32 @@ impl RdpViewer {
         }
     }
 
-    fn emit_input(&self, flags: u32) {
+    fn emit_input(&self, flags: u16) {
         let x_q16 = norm_to_q16(self.cursor_x / self.local_width.max(1) as f32);
         let y_q16 = norm_to_q16(self.cursor_y / self.local_height.max(1) as f32);
         let _ = self.input_tx.send(RdpInput::Tablet(RdpTabletInput {
-            slot_id: 1,
             x_q16,
             y_q16,
             buttons_down: self.buttons_down,
+            wheel: 0,
             flags,
+        }));
+    }
+
+    fn emit_wheel_input(&self, x: f32, y: f32) {
+        let wheel = if y.abs() >= x.abs() { y } else { x };
+        let wheel = wheel.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+        if wheel == 0 {
+            return;
+        }
+        let x_q16 = norm_to_q16(self.cursor_x / self.local_width.max(1) as f32);
+        let y_q16 = norm_to_q16(self.cursor_y / self.local_height.max(1) as f32);
+        let _ = self.input_tx.send(RdpInput::Tablet(RdpTabletInput {
+            x_q16,
+            y_q16,
+            buttons_down: self.buttons_down,
+            wheel,
+            flags: INPUT_FLAG_WHEEL,
         }));
     }
 
@@ -1057,7 +1097,7 @@ impl RdpViewer {
         self.target_text = if self.startup_host_mode {
             "trueos.eu".to_string()
         } else {
-            "1.1.1.1".to_string()
+            "192.168.178.94".to_string()
         };
         self.update_startup_target();
     }
@@ -1071,8 +1111,14 @@ impl FrameProducer for RdpViewer {
     }
 
     fn handle_input(&mut self, event: InputEvent) {
-        if !self.have_frame {
+        let startup_editing = !self.no_view && !self.have_frame;
+        if startup_editing {
             match event {
+                InputEvent::CursorMoved { x, y } => {
+                    self.cursor_x = x.clamp(0.0, self.local_width.max(1) as f32);
+                    self.cursor_y = y.clamp(0.0, self.local_height.max(1) as f32);
+                    return;
+                }
                 InputEvent::TextInput(text) => {
                     for ch in text.chars() {
                         if ch.is_ascii_graphic() && !ch.is_ascii_whitespace() {
@@ -1089,6 +1135,11 @@ impl FrameProducer for RdpViewer {
                 }
                 InputEvent::EnterPressed => {
                     self.update_startup_target();
+                    if self.no_view {
+                        self.connected = true;
+                        self.last_error = None;
+                        log_info!("noview input armed target={}", self.target_text);
+                    }
                     return;
                 }
                 InputEvent::KeyPressed(InputKey::Tab) => {
@@ -1111,6 +1162,7 @@ impl FrameProducer for RdpViewer {
                 }
                 _ => {}
             }
+            return;
         }
 
         match event {
@@ -1127,7 +1179,9 @@ impl FrameProducer for RdpViewer {
                 }
                 self.emit_input(INPUT_FLAG_BUTTONS);
             }
-            InputEvent::MouseWheel { .. } => self.emit_input(INPUT_FLAG_WHEEL),
+            InputEvent::MouseWheel { x, y } => {
+                self.emit_wheel_input(x, y);
+            }
             InputEvent::KeyboardInput { hid_keycode, state } => {
                 self.update_keyboard(hid_keycode, state)
             }
@@ -1154,6 +1208,10 @@ impl FrameProducer for RdpViewer {
             return;
         }
 
+        if self.no_view {
+            return;
+        }
+
         let mut drained = 0u32;
         while drained < 512 {
             match self.rx.try_recv() {
@@ -1170,37 +1228,48 @@ impl FrameProducer for RdpViewer {
         }
         self.pending_messages = self.pending_messages.saturating_add(drained as u64);
 
-        if let Some(due) = self.resize_recompose_due {
+        if !self.no_view
+            && let Some(due) = self.resize_recompose_due
+        {
             if Instant::now() >= due {
                 self.emit_recompose_request();
                 self.resize_recompose_due = None;
             }
         }
 
-        if !self.have_frame && !self.frame_active {
+        if !self.no_view && !self.have_frame && !self.frame_active {
             self.draw_logo(adapter);
         }
     }
 }
 
 fn main() {
-    let addr = env::args()
-        .nth(1)
-        .unwrap_or_else(|| DEFAULT_ADDR.to_string());
+    let (addr, no_view) = parse_args();
     log_info!(
-        "starting target={} log_level={}",
+        "starting target={} log_level={} mode={}",
         addr,
-        configured_log_level().as_str()
+        configured_log_level().as_str(),
+        if no_view { "NoView" } else { "View" }
     );
     let (tx, rx) = mpsc::channel();
     let (input_tx, input_rx) = mpsc::channel();
     let target = Arc::new(Mutex::new(addr.clone()));
-    let reader_target = Arc::clone(&target);
-    thread::spawn(move || rdp_reader(reader_target, tx, input_rx));
+    if no_view {
+        let input_target = Arc::clone(&target);
+        thread::spawn(move || hid_udp_only_sender(input_target, input_rx));
+        drop(tx);
+    } else {
+        let reader_target = Arc::clone(&target);
+        thread::spawn(move || rdp_reader(reader_target, tx, input_rx));
+    }
 
-    let producer = RdpViewer::new(rx, input_tx, target);
+    let producer = RdpViewer::new(rx, input_tx, target, no_view);
     let app = WgpuWindowApp::new(
-        format!("TRUEOS RDP Viewer - {}", addr),
+        format!(
+            "TRUEOS RDP Viewer{} - {}",
+            if no_view { " NoView" } else { "" },
+            addr
+        ),
         AdapterConfig::default(),
         producer,
     );
@@ -1209,13 +1278,240 @@ fn main() {
     }
 }
 
+fn parse_args() -> (String, bool) {
+    let mut no_view = false;
+    let mut target = None;
+    for arg in env::args().skip(1) {
+        if arg.eq_ignore_ascii_case("-NoView")
+            || arg.eq_ignore_ascii_case("--NoView")
+            || arg.eq_ignore_ascii_case("--no-view")
+        {
+            no_view = true;
+        } else if target.is_none() {
+            target = Some(arg);
+        } else {
+            log_warn!("ignored extra arg {}", arg);
+        }
+    }
+    (target.unwrap_or_else(|| DEFAULT_ADDR.to_string()), no_view)
+}
+
 fn resolve_addr(addr: &str) -> io::Result<SocketAddr> {
     addr.to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no socket address resolved"))
 }
 
+#[derive(Debug)]
+struct HidUdpSeqs {
+    keyboard: u32,
+    tablet: u32,
+}
+
+impl HidUdpSeqs {
+    fn new() -> Self {
+        let start = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis() as u32)
+            .unwrap_or(1);
+        Self {
+            keyboard: start,
+            tablet: start,
+        }
+    }
+
+    fn next_keyboard(&mut self) -> u32 {
+        self.keyboard = self.keyboard.wrapping_add(1);
+        self.keyboard
+    }
+
+    fn next_tablet(&mut self) -> u32 {
+        self.tablet = self.tablet.wrapping_add(1);
+        self.tablet
+    }
+}
+
+#[derive(Debug)]
+struct HidUdpSender {
+    socket: UdpSocket,
+    target: SocketAddr,
+}
+
+impl HidUdpSender {
+    fn connect(target: SocketAddr) -> io::Result<Self> {
+        let bind_addr = if target.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        };
+        Ok(Self {
+            socket: UdpSocket::bind(bind_addr)?,
+            target,
+        })
+    }
+
+    fn send_keyboard(&self, seq: u32, input: RdpKeyboardInput) -> io::Result<()> {
+        let payload = [
+            input.modifiers,
+            0,
+            input.keys[0],
+            input.keys[1],
+            input.keys[2],
+            input.keys[3],
+            input.keys[4],
+            input.keys[5],
+        ];
+        self.send_hid_packet(HID_UDP_KIND_KEYBOARD, 0, seq, payload.as_slice())
+    }
+
+    fn send_tablet(&self, seq: u32, input: RdpTabletInput) -> io::Result<()> {
+        let mut payload = Vec::with_capacity(16);
+        payload.extend_from_slice(&input.x_q16.to_le_bytes());
+        payload.extend_from_slice(&input.y_q16.to_le_bytes());
+        payload.extend_from_slice(&input.buttons_down.to_le_bytes());
+        payload.extend_from_slice(&input.wheel.to_le_bytes());
+        payload.extend_from_slice(&0u16.to_le_bytes());
+        self.send_hid_packet(HID_UDP_KIND_TABLET, input.flags, seq, payload.as_slice())
+    }
+
+    fn send_hid_packet(&self, kind: u8, flags: u16, seq: u32, payload: &[u8]) -> io::Result<()> {
+        let mut packet = Vec::with_capacity(16 + payload.len());
+        packet.extend_from_slice(HID_UDP_MAGIC);
+        packet.push(HID_UDP_VERSION);
+        packet.push(kind);
+        packet.extend_from_slice(&flags.to_le_bytes());
+        packet.extend_from_slice(&seq.to_le_bytes());
+        packet.extend_from_slice(&HID_UDP_DEVICE_ID.to_le_bytes());
+        packet.extend_from_slice(&0u16.to_le_bytes());
+        packet.extend_from_slice(payload);
+        let sent = self.socket.send_to(packet.as_slice(), self.target)?;
+        static HID_PACKET_TX_LOGS: AtomicU64 = AtomicU64::new(0);
+        let n = HID_PACKET_TX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+        if should_log_count(n) {
+            let local = self
+                .socket
+                .local_addr()
+                .map(|addr| addr.to_string())
+                .unwrap_or_else(|_| "?".to_string());
+            log_info!(
+                "udp hid tx packet #{} local={} target={} kind={} seq={} flags=0x{:X} sent={} bytes={} payload={}",
+                n,
+                local,
+                self.target,
+                kind,
+                seq,
+                flags,
+                sent,
+                packet.len(),
+                payload.len()
+            );
+        }
+        Ok(())
+    }
+}
+
+fn send_udp_hid_input(
+    hid_udp: &HidUdpSender,
+    hid_udp_seqs: &mut HidUdpSeqs,
+    input: RdpInput,
+) -> io::Result<bool> {
+    match input {
+        RdpInput::Tablet(input) => {
+            let seq = hid_udp_seqs.next_tablet();
+            hid_udp.send_tablet(seq, input)?;
+            static TABLET_TX_LOGS: AtomicU64 = AtomicU64::new(0);
+            let n = TABLET_TX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
+            if should_log_count(n) {
+                log_info!(
+                    "udp hid tx tablet #{} seq={} x_q16={} y_q16={} buttons=0x{:X} wheel={} flags=0x{:X}",
+                    n,
+                    seq,
+                    input.x_q16,
+                    input.y_q16,
+                    input.buttons_down,
+                    input.wheel,
+                    input.flags
+                );
+            }
+            Ok(true)
+        }
+        RdpInput::Keyboard(input) => {
+            hid_udp.send_keyboard(hid_udp_seqs.next_keyboard(), input)?;
+            Ok(true)
+        }
+        RdpInput::Recompose(_) | RdpInput::SnapshotAck => Ok(false),
+    }
+}
+
+fn hid_udp_only_sender(target: Arc<Mutex<String>>, input_rx: Receiver<RdpInput>) {
+    let mut hid_udp_seqs = HidUdpSeqs::new();
+    let mut active_target = String::new();
+    let mut hid_udp: Option<HidUdpSender> = None;
+
+    loop {
+        let target_text = target
+            .lock()
+            .map(|target| target.clone())
+            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
+        if hid_udp.is_none() || active_target != target_text {
+            active_target = target_text.clone();
+            match resolve_addr(&target_text) {
+                Ok(addr) => match HidUdpSender::connect(addr) {
+                    Ok(sender) => {
+                        log_info!(
+                            "noview udp hid target={} device={}",
+                            addr,
+                            HID_UDP_DEVICE_ID
+                        );
+                        let probe = RdpInput::Tablet(RdpTabletInput {
+                            x_q16: 32768,
+                            y_q16: 32768,
+                            buttons_down: 0,
+                            wheel: 0,
+                            flags: INPUT_FLAG_MOTION,
+                        });
+                        if let Err(err) = send_udp_hid_input(&sender, &mut hid_udp_seqs, probe) {
+                            log_warn!("noview udp hid probe failed target={} error={}", addr, err);
+                        }
+                        hid_udp = Some(sender);
+                    }
+                    Err(err) => {
+                        log_warn!("noview udp hid unavailable target={} error={}", addr, err);
+                        hid_udp = None;
+                    }
+                },
+                Err(err) => {
+                    log_warn!("noview resolve {} failed: {}", target_text, err);
+                    hid_udp = None;
+                }
+            }
+        }
+
+        match input_rx.recv_timeout(READ_TIMEOUT) {
+            Ok(input) => {
+                if let Some(sender) = hid_udp.as_ref()
+                    && let Err(err) = send_udp_hid_input(sender, &mut hid_udp_seqs, input)
+                {
+                    log_warn!(
+                        "noview udp hid send failed target={} error={}",
+                        active_target,
+                        err
+                    );
+                    hid_udp = None;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+
+        if hid_udp.is_none() {
+            thread::sleep(CONNECT_RETRY_DELAY);
+        }
+    }
+}
+
 fn rdp_reader(target: Arc<Mutex<String>>, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInput>) {
+    let mut hid_udp_seqs = HidUdpSeqs::new();
     loop {
         let addr_text = target
             .lock()
@@ -1237,10 +1533,26 @@ fn rdp_reader(target: Arc<Mutex<String>>, tx: Sender<RdpEvent>, input_rx: Receiv
         match TcpStream::connect_timeout(&addr, CONNECT_RETRY_DELAY) {
             Ok(mut stream) => {
                 log_info!("tcp connected to {}", addr);
+                let hid_udp = match HidUdpSender::connect(addr) {
+                    Ok(sender) => {
+                        log_info!("udp hid target={} device={}", addr, HID_UDP_DEVICE_ID);
+                        Some(sender)
+                    }
+                    Err(err) => {
+                        log_warn!("udp hid unavailable target={} error={}", addr, err);
+                        None
+                    }
+                };
                 let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
                 let _ = stream.set_nodelay(true);
                 let _ = tx.send(RdpEvent::Connected);
-                if let Err(err) = read_stream(&mut stream, &tx, &input_rx) {
+                if let Err(err) = read_stream(
+                    &mut stream,
+                    &tx,
+                    &input_rx,
+                    hid_udp.as_ref(),
+                    &mut hid_udp_seqs,
+                ) {
                     log_warn!("read loop ended: {}", err);
                     let _ = tx.send(RdpEvent::Disconnected(err.to_string()));
                 }
@@ -1262,12 +1574,14 @@ fn read_stream(
     stream: &mut TcpStream,
     tx: &Sender<RdpEvent>,
     input_rx: &Receiver<RdpInput>,
+    hid_udp: Option<&HidUdpSender>,
+    hid_udp_seqs: &mut HidUdpSeqs,
 ) -> io::Result<()> {
     let mut frames = 0u64;
     let mut bytes = 0u64;
     loop {
         let mut len_buf = [0u8; 4];
-        read_exact_retry_timeout(stream, &mut len_buf, input_rx)?;
+        read_exact_retry_timeout(stream, &mut len_buf, input_rx, hid_udp, hid_udp_seqs)?;
         let len = u32::from_le_bytes(len_buf) as usize;
         if len > MAX_FRAME_BYTES {
             return Err(io::Error::new(
@@ -1277,7 +1591,7 @@ fn read_stream(
         }
 
         let mut payload = vec![0u8; len];
-        read_exact_retry_timeout(stream, &mut payload, input_rx)?;
+        read_exact_retry_timeout(stream, &mut payload, input_rx, hid_udp, hid_udp_seqs)?;
         frames = frames.saturating_add(1);
         bytes = bytes.saturating_add(len as u64);
         if should_log_count(frames) {
@@ -1328,9 +1642,11 @@ fn read_exact_retry_timeout(
     stream: &mut TcpStream,
     mut buf: &mut [u8],
     input_rx: &Receiver<RdpInput>,
+    hid_udp: Option<&HidUdpSender>,
+    hid_udp_seqs: &mut HidUdpSeqs,
 ) -> io::Result<()> {
     while !buf.is_empty() {
-        drain_input(stream, input_rx)?;
+        drain_input(stream, input_rx, hid_udp, hid_udp_seqs)?;
         match stream.read(buf) {
             Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tcp eof")),
             Ok(n) => {
@@ -1341,7 +1657,7 @@ fn read_exact_retry_timeout(
                 if err.kind() == io::ErrorKind::WouldBlock
                     || err.kind() == io::ErrorKind::TimedOut =>
             {
-                drain_input(stream, input_rx)?;
+                drain_input(stream, input_rx, hid_udp, hid_udp_seqs)?;
                 continue;
             }
             Err(err) => return Err(err),
@@ -1350,61 +1666,36 @@ fn read_exact_retry_timeout(
     Ok(())
 }
 
-fn drain_input(stream: &mut TcpStream, input_rx: &Receiver<RdpInput>) -> io::Result<()> {
+fn drain_input(
+    stream: &mut TcpStream,
+    input_rx: &Receiver<RdpInput>,
+    hid_udp: Option<&HidUdpSender>,
+    hid_udp_seqs: &mut HidUdpSeqs,
+) -> io::Result<()> {
     loop {
         match input_rx.try_recv() {
-            Ok(input) => {
-                let frame = encode_input_frame(input);
+            Ok(RdpInput::Tablet(input)) => {
+                if let Some(hid_udp) = hid_udp {
+                    hid_udp.send_tablet(hid_udp_seqs.next_tablet(), input)?;
+                }
+            }
+            Ok(RdpInput::Keyboard(input)) => {
+                if let Some(hid_udp) = hid_udp {
+                    hid_udp.send_keyboard(hid_udp_seqs.next_keyboard(), input)?;
+                }
+            }
+            Ok(RdpInput::Recompose(input)) => {
+                let frame = encode_recompose_input_frame(input);
+                stream.write_all(frame.as_slice())?;
+            }
+            Ok(RdpInput::SnapshotAck) => {
+                let frame = encode_snapshot_ack_input_frame();
                 stream.write_all(frame.as_slice())?;
             }
             Err(mpsc::TryRecvError::Empty) => return Ok(()),
             Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
         }
     }
-}
-
-fn encode_input_frame(input: RdpInput) -> Vec<u8> {
-    match input {
-        RdpInput::Tablet(input) => encode_tablet_input_frame(input),
-        RdpInput::Keyboard(input) => encode_keyboard_input_frame(input),
-        RdpInput::Recompose(input) => encode_recompose_input_frame(input),
-        RdpInput::SnapshotAck => encode_snapshot_ack_input_frame(),
-    }
-}
-
-fn encode_tablet_input_frame(input: RdpTabletInput) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8 + 20);
-    payload.extend_from_slice(b"TRDP");
-    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    payload.extend_from_slice(&MSG_INPUT_TABLET_ABS.to_le_bytes());
-    payload.extend_from_slice(&input.slot_id.to_le_bytes());
-    payload.extend_from_slice(&input.x_q16.to_le_bytes());
-    payload.extend_from_slice(&input.y_q16.to_le_bytes());
-    payload.extend_from_slice(&input.buttons_down.to_le_bytes());
-    payload.extend_from_slice(&input.flags.to_le_bytes());
-
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload.as_slice());
-    frame
-}
-
-fn encode_keyboard_input_frame(input: RdpKeyboardInput) -> Vec<u8> {
-    let keys_lo = u32::from_le_bytes([input.keys[0], input.keys[1], input.keys[2], input.keys[3]]);
-    let keys_hi = u32::from_le_bytes([input.keys[4], input.keys[5], 0, 0]);
-    let mut payload = Vec::with_capacity(8 + 16);
-    payload.extend_from_slice(b"TRDP");
-    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    payload.extend_from_slice(&MSG_INPUT_KEYBOARD_BOOT.to_le_bytes());
-    payload.extend_from_slice(&1u32.to_le_bytes());
-    payload.extend_from_slice(&(input.modifiers as u32).to_le_bytes());
-    payload.extend_from_slice(&keys_lo.to_le_bytes());
-    payload.extend_from_slice(&keys_hi.to_le_bytes());
-
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload.as_slice());
-    frame
 }
 
 fn encode_recompose_input_frame(input: RdpRecomposeInput) -> Vec<u8> {
