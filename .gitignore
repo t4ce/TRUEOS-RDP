@@ -1,2 +1,4 @@
 /target/
+/.codex_tmp/
+/dist/
 adapterlibgfx/.codex_tmp/
