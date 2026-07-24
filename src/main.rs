@@ -1,1037 +1,109 @@
+mod input;
+mod media;
+
 use std::env;
-use std::io::{self, Cursor, Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::{
-    Arc, Mutex, OnceLock,
-    atomic::{AtomicU64, Ordering},
-    mpsc::{self, Receiver, Sender},
-};
-use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::io;
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
+use std::sync::mpsc::{self, Receiver, Sender};
 
 use adapterlibgfx::api::{Adapter, AdapterConfig};
-use adapterlibgfx::command::{Frame, FrameCommand, ScissorRect, TextureSampleKind};
+use adapterlibgfx::command::TextureSampleKind;
 use adapterlibgfx::window::{
-    FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
+    FrameProducer, InputButtonState, InputEvent, InputMouseButton, WgpuWindowApp,
 };
-use zune_core::bytestream::ZCursor;
-use zune_core::colorspace::ColorSpace;
-use zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
 
-const PROTOCOL_VERSION: u16 = 1;
-const DEFAULT_ADDR: &str = "192.168.178.94:100";
-const FIXED_RDP_PORT: &str = "100";
-const READ_TIMEOUT: Duration = Duration::from_millis(50);
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
-const RESIZE_RECOMPOSE_SETTLE_DELAY: Duration = Duration::from_millis(160);
-const MAX_FRAME_BYTES: usize = 128 * 1024 * 1024;
-const DETAILED_LOG_LIMIT: u64 = 16;
+use crate::input::{KeyboardInput, RemoteInput, TabletInput};
+use crate::media::{MediaConfig, MediaFeed, VideoFrame};
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-enum LogLevel {
-    Error = 1,
-    Warn = 2,
-    Info = 3,
-    Trace = 4,
-}
-
-static LOG_LEVEL: OnceLock<LogLevel> = OnceLock::new();
-
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        log(LogLevel::Error, format_args!($($arg)*))
-    };
-}
-
-macro_rules! log_warn {
-    ($($arg:tt)*) => {
-        log(LogLevel::Warn, format_args!($($arg)*))
-    };
-}
-
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        log(LogLevel::Info, format_args!($($arg)*))
-    };
-}
-
-macro_rules! log_trace {
-    ($($arg:tt)*) => {
-        log(LogLevel::Trace, format_args!($($arg)*))
-    };
-}
-
-fn log(level: LogLevel, args: std::fmt::Arguments<'_>) {
-    if level <= configured_log_level() {
-        eprintln!("rdp_viewer [{}]: {}", level.as_str(), args);
-    }
-}
-
-fn configured_log_level() -> LogLevel {
-    *LOG_LEVEL.get_or_init(|| match env::var("RDP_VIEWER_LOG") {
-        Ok(value) if value.eq_ignore_ascii_case("error") => LogLevel::Error,
-        Ok(value) if value.eq_ignore_ascii_case("warn") => LogLevel::Warn,
-        Ok(value) if value.eq_ignore_ascii_case("warning") => LogLevel::Warn,
-        Ok(value) if value.eq_ignore_ascii_case("trace") => LogLevel::Trace,
-        Ok(value) if value.eq_ignore_ascii_case("debug") => LogLevel::Trace,
-        _ => LogLevel::Info,
-    })
-}
-
-impl LogLevel {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Error => "error",
-            Self::Warn => "warn",
-            Self::Info => "info",
-            Self::Trace => "trace",
-        }
-    }
-}
-
-const MSG_HELLO: u16 = 1;
-const MSG_BEGIN_FRAME: u16 = 2;
-const MSG_END_FRAME: u16 = 3;
-const MSG_SET_BLEND: u16 = 4;
-const MSG_SET_SAMPLER: u16 = 5;
-const MSG_SET_SCISSOR: u16 = 6;
-const MSG_CLEAR_SCISSOR: u16 = 7;
-const MSG_SET_RENDER_TARGET: u16 = 8;
-const MSG_CLEAR_RENDER_TARGET: u16 = 9;
-const MSG_CLEAR_RECT: u16 = 10;
-const MSG_TEXTURE_RGBA: u16 = 11;
-const MSG_TEXTURE_PNG: u16 = 12;
-const MSG_TEXTURE_JPEG: u16 = 13;
-const MSG_TEXTURE_SVG: u16 = 14;
-const MSG_DRAW_RGB_TRIANGLES: u16 = 15;
-const MSG_DRAW_TEX_TRIANGLES: u16 = 16;
-const MSG_RESOURCE_SNAPSHOT_BEGIN: u16 = 17;
-const MSG_RESOURCE_SNAPSHOT_END: u16 = 18;
-const MSG_SHADER_CREATE: u16 = 19;
-const MSG_PIPELINE_CREATE: u16 = 20;
-const MSG_DRAW_PIPELINE_TRIANGLES: u16 = 21;
-const MSG_CLEAR_COLOR_RGBA: u16 = 22;
-const MSG_CLIENT_RECOMPOSE: u16 = 102;
-const MSG_RESOURCE_SNAPSHOT_ACK: u16 = 103;
-const HID_UDP_MAGIC: &[u8; 4] = b"THID";
-const HID_UDP_VERSION: u8 = 1;
-const HID_UDP_KIND_KEYBOARD: u8 = 2;
-const HID_UDP_KIND_TABLET: u8 = 3;
-const HID_UDP_DEVICE_ID: u16 = 1;
-const INPUT_FLAG_MOTION: u16 = 1 << 0;
-const INPUT_FLAG_WHEEL: u16 = 1 << 1;
-const INPUT_FLAG_BUTTONS: u16 = 1 << 2;
-const LOGO_TEX_ID: u32 = 0xFFFF_FFFE;
-const LOGO_JPEG: &[u8] = include_bytes!("../logo.jpg");
+const DEFAULT_HOST: &str = "192.168.178.94";
+const INPUT_PORT: u16 = 100;
+const MEDIA_PORT: u16 = 9650;
+const INITIAL_WINDOW_WIDTH: u32 = 640;
+const INITIAL_WINDOW_HEIGHT: u32 = 400;
+const VIDEO_TEXTURE_ID: u32 = 1;
 
 #[derive(Debug)]
-enum RdpEvent {
-    Connected,
-    Disconnected(String),
-    Message(RdpMessage),
-}
-
-#[derive(Debug)]
-enum RdpMessage {
-    Hello {
-        width: u32,
-        height: u32,
-        caps: u32,
-    },
-    BeginFrame {
-        seq: u32,
-        flags: u32,
-        clear_rgb: u32,
-    },
-    EndFrame {
-        seq: u32,
-        flags: u32,
-    },
-    SetBlend {
-        seq: u32,
-        enabled: u32,
-        src_rgb: u32,
-        dst_rgb: u32,
-    },
-    SetSampler {
-        seq: u32,
-        wrap_s: u32,
-        wrap_t: u32,
-        min_filter: u32,
-        mag_filter: u32,
-    },
-    SetScissor {
-        seq: u32,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    },
-    ClearScissor {
-        seq: u32,
-    },
-    SetRenderTarget {
-        seq: u32,
-        tex_id: u32,
-    },
-    ClearRenderTarget {
-        seq: u32,
-    },
-    ClearRect {
-        seq: u32,
-        rgb: u32,
-        x: u32,
-        y: u32,
-        width: u32,
-        height: u32,
-    },
-    ClearColorRgba {
-        seq: u32,
-        r: u32,
-        g: u32,
-        b: u32,
-        a: u32,
-    },
-    TextureRgba {
-        tex_id: u32,
-        width: u32,
-        height: u32,
-        region: Option<(u32, u32, u32, u32)>,
-        rgba: Vec<u8>,
-    },
-    TexturePng {
-        tex_id: u32,
-        bytes: Vec<u8>,
-    },
-    TextureJpeg {
-        tex_id: u32,
-        bytes: Vec<u8>,
-    },
-    TextureSvg {
-        tex_id: u32,
-        bytes: usize,
-    },
-    DrawRgb {
-        seq: u32,
-        bytes: Vec<u8>,
-    },
-    DrawTex {
-        seq: u32,
-        tex_id: u32,
-        sampler_flags: u32,
-        sample_kind: TextureSampleKind,
-        bytes: Vec<u8>,
-    },
-    ShaderCreate {
-        shader_id: u32,
-        stage: u32,
-        format: u32,
-        flags: u32,
-        bytes: Vec<u8>,
-    },
-    PipelineCreate {
-        pipeline_id: u32,
-        stride: u32,
-        pos_offset: u32,
-        color_offset: u32,
-        color_format: u32,
-        texcoord_offset: u32,
-        texcoord_format: u32,
-        vs_shader_id: u32,
-        fs_shader_id: u32,
-    },
-    DrawPipeline {
-        seq: u32,
-        pipeline_id: u32,
-        bytes: Vec<u8>,
-    },
-    SnapshotBegin {
-        textures: u32,
-        bytes: u32,
-    },
-    SnapshotEnd,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum RdpInput {
-    Tablet(RdpTabletInput),
-    Keyboard(RdpKeyboardInput),
-    Recompose(RdpRecomposeInput),
-    SnapshotAck,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RdpTabletInput {
-    x_q16: u32,
-    y_q16: u32,
-    buttons_down: u32,
-    wheel: i16,
-    flags: u16,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RdpKeyboardInput {
-    modifiers: u8,
-    keys: [u8; 6],
-}
-
-#[derive(Clone, Copy, Debug)]
-struct RdpRecomposeInput {
-    width: u32,
-    height: u32,
-}
-
-struct RdpViewer {
-    rx: Receiver<RdpEvent>,
-    input_tx: Sender<RdpInput>,
-    target: Arc<Mutex<String>>,
-    target_text: String,
+struct AppConfig {
+    host: String,
     no_view: bool,
-    connected: bool,
-    frame_active: bool,
-    active_frame_seq: u32,
-    have_frame: bool,
-    startup_frame_presented: bool,
-    asset_sync_active: bool,
-    asset_sync_ready: bool,
-    asset_sync_remaining: u32,
-    dropping_frame_depth: u32,
-    frames: u64,
-    pending_messages: u64,
-    textures: u64,
-    rgb_draws: u64,
-    tex_draws: u64,
-    bytes_received: u64,
-    last_error: Option<String>,
-    width: u32,
-    height: u32,
-    local_width: u32,
-    local_height: u32,
+}
+
+struct Viewer {
+    media: Option<MediaFeed>,
+    input_tx: Sender<RemoteInput>,
+    no_view: bool,
+    window_width: u32,
+    window_height: u32,
+    source_width: u32,
+    source_height: u32,
+    have_video: bool,
     cursor_x: f32,
     cursor_y: f32,
     buttons_down: u32,
     keyboard_modifiers: u8,
     keyboard_keys: [u8; 6],
-    resize_recompose_due: Option<Instant>,
-    startup_host_mode: bool,
-    logo_texture_ready: bool,
-    logo_width: u32,
-    logo_height: u32,
-    startup_started: Instant,
+    decoded_frames: u64,
 }
 
-impl RdpViewer {
-    fn new(
-        rx: Receiver<RdpEvent>,
-        input_tx: Sender<RdpInput>,
-        target: Arc<Mutex<String>>,
-        no_view: bool,
-    ) -> Self {
-        let target_text = target
-            .lock()
-            .map(|target| target.clone())
-            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-        let startup_host_mode = !looks_like_ip(split_target(&target_text).0);
-        if no_view {
-            log_info!("noview input armed target={}", target_text);
-        }
+impl Viewer {
+    fn new(media: Option<MediaFeed>, input_tx: Sender<RemoteInput>, no_view: bool) -> Self {
         Self {
-            rx,
+            media,
             input_tx,
-            target,
-            target_text,
             no_view,
-            connected: no_view,
-            frame_active: false,
-            active_frame_seq: 0,
-            have_frame: false,
-            startup_frame_presented: false,
-            asset_sync_active: false,
-            asset_sync_ready: false,
-            asset_sync_remaining: 0,
-            dropping_frame_depth: 0,
-            frames: 0,
-            pending_messages: 0,
-            textures: 0,
-            rgb_draws: 0,
-            tex_draws: 0,
-            bytes_received: 0,
-            last_error: None,
-            width: 1280,
-            height: 800,
-            local_width: 1280,
-            local_height: 800,
+            window_width: INITIAL_WINDOW_WIDTH,
+            window_height: INITIAL_WINDOW_HEIGHT,
+            source_width: media::VIDEO_WIDTH,
+            source_height: media::VIDEO_HEIGHT,
+            have_video: false,
             cursor_x: 0.0,
             cursor_y: 0.0,
             buttons_down: 0,
             keyboard_modifiers: 0,
             keyboard_keys: [0; 6],
-            resize_recompose_due: None,
-            startup_host_mode,
-            logo_texture_ready: false,
-            logo_width: 0,
-            logo_height: 0,
-            startup_started: Instant::now(),
+            decoded_frames: 0,
         }
     }
 
-    fn apply_event(&mut self, adapter: &mut Adapter, event: RdpEvent) {
-        match event {
-            RdpEvent::Connected => {
-                self.connected = true;
-                self.last_error = None;
-                self.frame_active = false;
-                self.active_frame_seq = 0;
-                self.have_frame = false;
-                self.asset_sync_active = false;
-                self.asset_sync_ready = false;
-                self.asset_sync_remaining = 0;
-                self.dropping_frame_depth = 0;
-                log_info!("connected");
-            }
-            RdpEvent::Disconnected(reason) => {
-                self.connected = false;
-                if self.last_error.as_deref() != Some(reason.as_str()) {
-                    log_warn!("disconnected: {}", reason);
-                }
-                self.last_error = Some(reason);
-            }
-            RdpEvent::Message(msg) => self.apply_message(adapter, msg),
-        }
+    fn take_latest_video_frame(&mut self) -> Option<VideoFrame> {
+        self.media.as_ref().and_then(MediaFeed::take_latest_frame)
     }
 
-    fn frame_seq_active(&self, seq: u32) -> bool {
-        self.frame_active && self.active_frame_seq == seq
-    }
-
-    fn note_asset_synced(&mut self) {
-        if self.asset_sync_active && self.asset_sync_remaining > 0 {
-            self.asset_sync_remaining -= 1;
-        }
-        if !self.asset_sync_active && self.asset_sync_remaining == 0 {
-            self.asset_sync_ready = true;
-        }
-    }
-
-    fn log_frame_shape(&self, frame: &Frame) {
-        if !should_log_count(self.frames.saturating_add(1)) {
-            return;
-        }
-        let mut target = 0u32;
-        let mut screen_rgb = 0u32;
-        let mut screen_tex = 0u32;
-        let mut offscreen_rgb = 0u32;
-        let mut offscreen_tex = 0u32;
-        let mut target_sets = 0u32;
-        for command in &frame.commands {
-            match command {
-                FrameCommand::SetRenderTarget(tex_id) => {
-                    target = *tex_id;
-                    target_sets = target_sets.saturating_add(1);
-                }
-                FrameCommand::DrawRgb { .. } if target == 0 => {
-                    screen_rgb = screen_rgb.saturating_add(1)
-                }
-                FrameCommand::DrawTex { .. } if target == 0 => {
-                    screen_tex = screen_tex.saturating_add(1)
-                }
-                FrameCommand::DrawPipeline { .. } if target == 0 => {
-                    screen_tex = screen_tex.saturating_add(1)
-                }
-                FrameCommand::DrawRgb { .. } => offscreen_rgb = offscreen_rgb.saturating_add(1),
-                FrameCommand::DrawTex { .. } => offscreen_tex = offscreen_tex.saturating_add(1),
-                FrameCommand::DrawPipeline { .. } => {
-                    offscreen_tex = offscreen_tex.saturating_add(1)
-                }
-                FrameCommand::ClearRgba { .. } => {}
-                _ => {}
-            }
-        }
-        log_info!(
-            "frame_shape seq={} cmds={} present={} preserve={} clear=0x{:06x} targets={} final_target={} screen_rgb={} screen_tex={} offscreen_rgb={} offscreen_tex={}",
-            frame.seq,
-            frame.commands.len(),
-            frame.allow_present as u8,
-            frame.preserve_contents as u8,
-            frame.clear_rgb & 0x00ff_ffff,
-            target_sets,
-            target,
-            screen_rgb,
-            screen_tex,
-            offscreen_rgb,
-            offscreen_tex
-        );
-    }
-
-    fn draw_logo(&mut self, adapter: &mut Adapter) {
-        if !self.logo_texture_ready {
-            match decode_jpeg_rgba(LOGO_JPEG) {
-                Ok((width, height, rgba)) => {
-                    if adapter.upload_texture_rgba_image(LOGO_TEX_ID, width, height, &rgba) == 0 {
-                        self.logo_width = width;
-                        self.logo_height = height;
-                        self.logo_texture_ready = true;
-                    }
-                }
-                Err(err) => {
-                    log_warn!("logo decode failed: {}", err);
-                    self.logo_texture_ready = true;
-                }
-            }
-        }
-
-        let bg = if self.connected || self.no_view {
-            0x102030
-        } else {
-            0x281820
-        };
-        let _ = adapter.begin_frame(bg);
-        if self.logo_texture_ready {
-            let vertices = logo_vertices(
-                self.logo_width,
-                self.logo_height,
-                self.local_width,
-                self.local_height,
-            );
-            let _ = adapter.set_sampler_raw(0, 0, 1, 1);
-            let _ = adapter.draw_tex_triangles_sample_kind_no_present(
-                LOGO_TEX_ID,
-                TextureSampleKind::Rgba,
-                &vertices,
+    fn normalized_cursor(&self) -> (f32, f32) {
+        if self.no_view || !self.have_video {
+            return (
+                self.cursor_x / self.window_width.max(1) as f32,
+                self.cursor_y / self.window_height.max(1) as f32,
             );
         }
-        if self.no_view {
-            let _ = adapter.end_frame();
-            return;
-        }
 
-        let status = if self.have_frame {
-            None
-        } else if self.connected && self.asset_sync_ready {
-            Some("connected - waiting for first frame")
-        } else if self.connected && self.asset_sync_active {
-            Some("connected - syncing assets")
-        } else if self.connected {
-            Some("connected")
-        } else {
-            self.last_error.as_deref()
-        };
-        draw_startup_panel(
-            adapter,
-            self.local_width,
-            self.local_height,
-            &self.target_text,
-            status,
-            self.startup_started.elapsed(),
+        let rect = aspect_fit_rect(
+            self.window_width,
+            self.window_height,
+            self.source_width,
+            self.source_height,
         );
-        let _ = adapter.end_frame();
+        (
+            (self.cursor_x - rect.x) / rect.width.max(1.0),
+            (self.cursor_y - rect.y) / rect.height.max(1.0),
+        )
     }
 
-    fn apply_message(&mut self, adapter: &mut Adapter, msg: RdpMessage) {
-        match msg {
-            RdpMessage::Hello {
-                width,
-                height,
-                caps,
-            } => {
-                self.width = width.max(1);
-                self.height = height.max(1);
-                log_info!(
-                    "hello view={}x{} caps=0x{:08x}",
-                    self.width,
-                    self.height,
-                    caps
-                );
-            }
-            RdpMessage::BeginFrame {
-                seq,
-                flags,
-                clear_rgb,
-            } => {
-                if self.dropping_frame_depth > 0 {
-                    self.dropping_frame_depth = self.dropping_frame_depth.saturating_add(1);
-                    return;
-                }
-                if !self.asset_sync_ready {
-                    self.dropping_frame_depth = 1;
-                    return;
-                }
-                if self.frame_active {
-                    log_warn!(
-                        "begin_frame seq={} while active seq={}; closing previous frame",
-                        seq,
-                        self.active_frame_seq
-                    );
-                    let _ = adapter.end_frame();
-                    self.frame_active = false;
-                    self.active_frame_seq = 0;
-                }
-                let preserve_requested = (flags & 1) != 0;
-                let allow_present = (flags & 2) != 0;
-                let preserve = preserve_requested && (!allow_present || self.have_frame);
-                let status = match (preserve, allow_present) {
-                    (true, true) => adapter.begin_frame_preserve(clear_rgb),
-                    (true, false) => adapter.begin_frame_preserve_no_present(clear_rgb),
-                    (false, true) => adapter.begin_frame(clear_rgb),
-                    (false, false) => adapter.begin_frame_no_present(clear_rgb),
-                };
-                self.frame_active = status == 0;
-                self.active_frame_seq = if status == 0 { seq } else { 0 };
-                if status != 0 {
-                    log_warn!(
-                        "begin_frame failed seq={} status={} flags=0x{:08x} clear=0x{:06x}",
-                        seq,
-                        status,
-                        flags,
-                        clear_rgb & 0x00ff_ffff
-                    );
-                }
-            }
-            RdpMessage::EndFrame { seq, flags } => {
-                if self.dropping_frame_depth > 0 {
-                    self.dropping_frame_depth = self.dropping_frame_depth.saturating_sub(1);
-                    return;
-                }
-                if self.frame_seq_active(seq) {
-                    adapter.override_active_frame_mode((flags & 2) != 0, (flags & 1) != 0);
-                    if let Ok(frame) = adapter.end_frame() {
-                        self.log_frame_shape(&frame);
-                        if frame.allow_present {
-                            self.have_frame = true;
-                        }
-                        self.frames = self.frames.saturating_add(1);
-                        if should_log_count(self.frames) {
-                            log_info!(
-                                "frame={} textures={} rgb_draws={} tex_draws={} bytes={} drained_msgs={}",
-                                self.frames,
-                                self.textures,
-                                self.rgb_draws,
-                                self.tex_draws,
-                                self.bytes_received,
-                                self.pending_messages
-                            );
-                        }
-                    } else {
-                        log_warn!("end_frame failed");
-                    }
-                    self.frame_active = false;
-                    self.active_frame_seq = 0;
-                } else {
-                    log_warn!(
-                        "end_frame seq={} without matching active frame seq={}",
-                        seq,
-                        self.active_frame_seq
-                    );
-                }
-            }
-            RdpMessage::SetBlend {
-                seq,
-                enabled,
-                src_rgb,
-                dst_rgb,
-            } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.set_blend_raw(enabled, src_rgb, dst_rgb);
-                }
-            }
-            RdpMessage::SetSampler {
-                seq,
-                wrap_s,
-                wrap_t,
-                min_filter,
-                mag_filter,
-            } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.set_sampler_raw(wrap_s, wrap_t, min_filter, mag_filter);
-                }
-            }
-            RdpMessage::SetScissor {
-                seq,
-                x,
-                y,
-                width,
-                height,
-            } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.set_scissor(Some(ScissorRect {
-                        x,
-                        y,
-                        width,
-                        height,
-                    }));
-                }
-            }
-            RdpMessage::ClearScissor { seq } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.set_scissor(None);
-                }
-            }
-            RdpMessage::SetRenderTarget { seq, tex_id } => {
-                if self.frame_seq_active(seq) {
-                    let rc = adapter.set_render_target(tex_id);
-                    if rc != 0 {
-                        log_warn!(
-                            "set_render_target failed seq={} tex={} rc={}",
-                            seq,
-                            tex_id,
-                            rc
-                        );
-                    }
-                }
-            }
-            RdpMessage::ClearRenderTarget { seq } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.set_render_target(0);
-                }
-            }
-            RdpMessage::ClearRect {
-                seq,
-                rgb,
-                x,
-                y,
-                width,
-                height,
-            } => {
-                if self.frame_seq_active(seq) {
-                    draw_clear_rect(adapter, rgb, x, y, width, height);
-                }
-            }
-            RdpMessage::ClearColorRgba { seq, r, g, b, a } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.clear_rgba_raw(r, g, b, a);
-                }
-            }
-            RdpMessage::TextureRgba {
-                tex_id,
-                width,
-                height,
-                region,
-                rgba,
-            } => {
-                upload_texture_rgba(adapter, tex_id, width, height, region, &rgba);
-                self.note_asset_synced();
-                self.textures = self.textures.saturating_add(1);
-                self.bytes_received = self.bytes_received.saturating_add(rgba.len() as u64);
-                if should_log_count(self.textures) {
-                    match region {
-                        Some((x, y, w, h)) => log_trace!(
-                            "texture_rgba #{} tex={} full={}x{} region={}x{}+{},{} bytes={}",
-                            self.textures,
-                            tex_id,
-                            width,
-                            height,
-                            w,
-                            h,
-                            x,
-                            y,
-                            rgba.len()
-                        ),
-                        None => log_trace!(
-                            "texture_rgba #{} tex={} size={}x{} bytes={}",
-                            self.textures,
-                            tex_id,
-                            width,
-                            height,
-                            rgba.len()
-                        ),
-                    }
-                }
-            }
-            RdpMessage::TexturePng { tex_id, bytes } => match decode_png_rgba(&bytes) {
-                Ok((width, height, rgba)) => {
-                    let _ = adapter.upload_texture_rgba_image(tex_id, width, height, &rgba);
-                    self.note_asset_synced();
-                    self.textures = self.textures.saturating_add(1);
-                    self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                    if should_log_count(self.textures) {
-                        log_trace!(
-                            "texture_png #{} tex={} size={}x{} compressed={} decoded={}",
-                            self.textures,
-                            tex_id,
-                            width,
-                            height,
-                            bytes.len(),
-                            rgba.len()
-                        );
-                    }
-                }
-                Err(err) => {
-                    self.note_asset_synced();
-                    log_warn!(
-                        "png texture {} decode failed bytes={}: {}",
-                        tex_id,
-                        bytes.len(),
-                        err
-                    );
-                    self.last_error =
-                        Some(format!("png texture {} decode failed: {}", tex_id, err));
-                }
-            },
-            RdpMessage::TextureJpeg { tex_id, bytes } => match decode_jpeg_rgba(&bytes) {
-                Ok((width, height, rgba)) => {
-                    let _ = adapter.upload_texture_rgba_image(tex_id, width, height, &rgba);
-                    self.note_asset_synced();
-                    self.textures = self.textures.saturating_add(1);
-                    self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                    if should_log_count(self.textures) {
-                        log_trace!(
-                            "texture_jpeg #{} tex={} size={}x{} compressed={} decoded={}",
-                            self.textures,
-                            tex_id,
-                            width,
-                            height,
-                            bytes.len(),
-                            rgba.len()
-                        );
-                    }
-                }
-                Err(err) => {
-                    self.note_asset_synced();
-                    log_warn!(
-                        "jpeg texture {} decode failed bytes={}: {}",
-                        tex_id,
-                        bytes.len(),
-                        err
-                    );
-                    self.last_error =
-                        Some(format!("jpeg texture {} decode failed: {}", tex_id, err));
-                }
-            },
-            RdpMessage::TextureSvg { tex_id, bytes } => {
-                upload_svg_placeholder(adapter, tex_id);
-                self.note_asset_synced();
-                self.textures = self.textures.saturating_add(1);
-                self.bytes_received = self.bytes_received.saturating_add(bytes as u64);
-                if should_log_count(self.textures) {
-                    log_warn!(
-                        "texture_svg #{} tex={} unsupported bytes={} placeholder=magenta",
-                        self.textures,
-                        tex_id,
-                        bytes
-                    );
-                }
-            }
-            RdpMessage::DrawRgb { seq, bytes } => {
-                if self.frame_seq_active(seq) {
-                    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
-                }
-                self.rgb_draws = self.rgb_draws.saturating_add(1);
-                self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                if should_log_count(self.rgb_draws) {
-                    log_trace!(
-                        "draw_rgb #{} vertices={} bytes={}",
-                        self.rgb_draws,
-                        bytes.len() / 12,
-                        bytes.len()
-                    );
-                }
-            }
-            RdpMessage::DrawTex {
-                seq,
-                tex_id,
-                sampler_flags,
-                sample_kind,
-                bytes,
-            } => {
-                if self.frame_seq_active(seq) {
-                    apply_sampler_flags(adapter, sampler_flags);
-                    let rc = adapter.draw_tex_triangles_sample_kind_no_present(
-                        tex_id,
-                        sample_kind,
-                        &bytes,
-                    );
-                    if rc != 0 {
-                        log_warn!(
-                            "draw_tex failed seq={} tex={} rc={} sample={:?} bytes={}",
-                            seq,
-                            tex_id,
-                            rc,
-                            sample_kind,
-                            bytes.len()
-                        );
-                    }
-                }
-                self.tex_draws = self.tex_draws.saturating_add(1);
-                self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                if should_log_count(self.tex_draws) {
-                    log_trace!(
-                        "draw_tex #{} tex={} vertices={} sampler=0x{:08x} sample={:?} bytes={}",
-                        self.tex_draws,
-                        tex_id,
-                        bytes.len() / 20,
-                        sampler_flags,
-                        sample_kind,
-                        bytes.len()
-                    );
-                }
-            }
-            RdpMessage::ShaderCreate {
-                shader_id,
-                stage,
-                format,
-                flags,
-                bytes,
-            } => {
-                let rc = adapter.create_shader_raw(shader_id, stage, format, &bytes);
-                if rc != 0 {
-                    log_warn!(
-                        "shader_create failed shader={} stage={} format={} flags=0x{:08x} rc={} bytes={}",
-                        shader_id,
-                        stage,
-                        format,
-                        flags,
-                        rc,
-                        bytes.len()
-                    );
-                } else {
-                    self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                    log_trace!(
-                        "shader_create shader={} stage={} format={} flags=0x{:08x} bytes={}",
-                        shader_id,
-                        stage,
-                        format,
-                        flags,
-                        bytes.len()
-                    );
-                }
-            }
-            RdpMessage::PipelineCreate {
-                pipeline_id,
-                stride,
-                pos_offset,
-                color_offset,
-                color_format,
-                texcoord_offset,
-                texcoord_format,
-                vs_shader_id,
-                fs_shader_id,
-            } => {
-                let rc = adapter.create_pipeline_raw(
-                    pipeline_id,
-                    stride,
-                    pos_offset,
-                    color_offset,
-                    color_format,
-                    texcoord_offset,
-                    texcoord_format,
-                    vs_shader_id,
-                    fs_shader_id,
-                );
-                if rc != 0 {
-                    log_warn!(
-                        "pipeline_create failed pipeline={} vs={} fs={} rc={}",
-                        pipeline_id,
-                        vs_shader_id,
-                        fs_shader_id,
-                        rc
-                    );
-                } else {
-                    log_trace!(
-                        "pipeline_create pipeline={} stride={} vs={} fs={}",
-                        pipeline_id,
-                        stride,
-                        vs_shader_id,
-                        fs_shader_id
-                    );
-                }
-            }
-            RdpMessage::DrawPipeline {
-                seq,
-                pipeline_id,
-                bytes,
-            } => {
-                if self.frame_seq_active(seq) {
-                    let rc = adapter.draw_pipeline_triangles_no_present(pipeline_id, &bytes);
-                    if rc != 0 {
-                        log_warn!(
-                            "draw_pipeline failed seq={} pipeline={} rc={} bytes={}",
-                            seq,
-                            pipeline_id,
-                            rc,
-                            bytes.len()
-                        );
-                    }
-                }
-                self.tex_draws = self.tex_draws.saturating_add(1);
-                self.bytes_received = self.bytes_received.saturating_add(bytes.len() as u64);
-                if should_log_count(self.tex_draws) {
-                    log_trace!(
-                        "draw_pipeline #{} pipeline={} vertices={} bytes={}",
-                        self.tex_draws,
-                        pipeline_id,
-                        bytes.len() / 20,
-                        bytes.len()
-                    );
-                }
-            }
-            RdpMessage::SnapshotBegin { textures, bytes } => {
-                if self.frame_active {
-                    let _ = adapter.end_frame();
-                    self.frame_active = false;
-                    self.active_frame_seq = 0;
-                }
-                self.asset_sync_active = true;
-                self.asset_sync_ready = textures == 0;
-                self.asset_sync_remaining = textures;
-                self.dropping_frame_depth = 0;
-                log_info!("asset sync begin textures={} bytes={}", textures, bytes);
-            }
-            RdpMessage::SnapshotEnd => {
-                self.asset_sync_active = false;
-                self.asset_sync_ready = self.asset_sync_remaining == 0;
-                log_info!(
-                    "asset sync end ready={} pending={}",
-                    self.asset_sync_ready,
-                    self.asset_sync_remaining
-                );
-                if self.asset_sync_ready {
-                    let _ = self.input_tx.send(RdpInput::SnapshotAck);
-                }
-            }
-        }
-    }
-
-    fn emit_input(&self, flags: u16) {
-        let x_q16 = norm_to_q16(self.cursor_x / self.local_width.max(1) as f32);
-        let y_q16 = norm_to_q16(self.cursor_y / self.local_height.max(1) as f32);
-        let _ = self.input_tx.send(RdpInput::Tablet(RdpTabletInput {
-            x_q16,
-            y_q16,
+    fn emit_tablet(&self, flags: u16, wheel: i16) {
+        let (x, y) = self.normalized_cursor();
+        let _ = self.input_tx.send(RemoteInput::Tablet(TabletInput {
+            x_q16: norm_to_q16(x),
+            y_q16: norm_to_q16(y),
             buttons_down: self.buttons_down,
-            wheel: 0,
+            wheel,
             flags,
         }));
     }
 
-    fn emit_wheel_input(&self, x: f32, y: f32) {
-        let wheel = if y.abs() >= x.abs() { y } else { x };
-        let wheel = wheel.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
-        if wheel == 0 {
-            return;
-        }
-        let x_q16 = norm_to_q16(self.cursor_x / self.local_width.max(1) as f32);
-        let y_q16 = norm_to_q16(self.cursor_y / self.local_height.max(1) as f32);
-        let _ = self.input_tx.send(RdpInput::Tablet(RdpTabletInput {
-            x_q16,
-            y_q16,
-            buttons_down: self.buttons_down,
-            wheel,
-            flags: INPUT_FLAG_WHEEL,
-        }));
-    }
-
-    fn emit_keyboard_input(&self) {
-        let _ = self.input_tx.send(RdpInput::Keyboard(RdpKeyboardInput {
+    fn emit_keyboard(&self) {
+        let _ = self.input_tx.send(RemoteInput::Keyboard(KeyboardInput {
             modifiers: self.keyboard_modifiers,
             keys: self.keyboard_keys,
-        }));
-    }
-
-    fn emit_recompose_request(&self) {
-        let _ = self.input_tx.send(RdpInput::Recompose(RdpRecomposeInput {
-            width: self.local_width,
-            height: self.local_height,
         }));
     }
 
@@ -1042,7 +114,7 @@ impl RdpViewer {
                 InputButtonState::Pressed => self.keyboard_modifiers |= bit,
                 InputButtonState::Released => self.keyboard_modifiers &= !bit,
             }
-            self.emit_keyboard_input();
+            self.emit_keyboard();
             return;
         }
 
@@ -1052,10 +124,10 @@ impl RdpViewer {
 
         match state {
             InputButtonState::Pressed => {
-                if !self.keyboard_keys.iter().any(|key| *key == hid_keycode) {
-                    if let Some(slot) = self.keyboard_keys.iter_mut().find(|key| **key == 0) {
-                        *slot = hid_keycode;
-                    }
+                if !self.keyboard_keys.contains(&hid_keycode)
+                    && let Some(slot) = self.keyboard_keys.iter_mut().find(|key| **key == 0)
+                {
+                    *slot = hid_keycode;
                 }
             }
             InputButtonState::Released => {
@@ -1066,110 +138,48 @@ impl RdpViewer {
                 }
             }
         }
-        self.emit_keyboard_input();
+        self.emit_keyboard();
     }
 
-    fn update_startup_target(&mut self) {
-        let trimmed = self.target_text.trim();
-        if trimmed.is_empty() {
+    fn upload_latest_frame(&mut self, adapter: &mut Adapter) {
+        let Some(frame) = self.take_latest_video_frame() else {
             return;
-        }
-        let (host, _) = split_target(trimmed);
-        if host.trim().is_empty() {
-            return;
-        }
-        let connect_target = format!("{}:{}", host.trim(), FIXED_RDP_PORT);
-        if let Ok(mut target) = self.target.lock() {
-            if target.as_str() != connect_target {
-                *target = connect_target.clone();
-                log_info!("startup target set to {}", connect_target);
-            }
-        }
-    }
-
-    fn toggle_startup_mode(&mut self) {
-        self.startup_host_mode = !self.startup_host_mode;
-        self.set_startup_mode(self.startup_host_mode);
-    }
-
-    fn set_startup_mode(&mut self, host_mode: bool) {
-        self.startup_host_mode = host_mode;
-        self.target_text = if self.startup_host_mode {
-            "trueos.eu".to_string()
-        } else {
-            "192.168.178.94".to_string()
         };
-        self.update_startup_target();
+        self.source_width = frame.width;
+        self.source_height = frame.height;
+        self.decoded_frames = frame.sequence;
+        if adapter.upload_texture_rgba_image_owned(
+            VIDEO_TEXTURE_ID,
+            frame.width,
+            frame.height,
+            frame.rgba,
+        ) == 0
+        {
+            self.have_video = true;
+        }
     }
 }
 
-impl FrameProducer for RdpViewer {
+impl FrameProducer for Viewer {
+    fn cursor_visible(&self) -> bool {
+        self.no_view
+    }
+
+    fn window_resizable(&self) -> bool {
+        true
+    }
+
     fn resize(&mut self, width: u32, height: u32) {
-        self.local_width = width.max(1);
-        self.local_height = height.max(1);
-        self.resize_recompose_due = Some(Instant::now() + RESIZE_RECOMPOSE_SETTLE_DELAY);
+        self.window_width = width.max(1);
+        self.window_height = height.max(1);
     }
 
     fn handle_input(&mut self, event: InputEvent) {
-        let startup_editing = !self.no_view && !self.have_frame;
-        if startup_editing {
-            match event {
-                InputEvent::CursorMoved { x, y } => {
-                    self.cursor_x = x.clamp(0.0, self.local_width.max(1) as f32);
-                    self.cursor_y = y.clamp(0.0, self.local_height.max(1) as f32);
-                    return;
-                }
-                InputEvent::TextInput(text) => {
-                    for ch in text.chars() {
-                        if ch.is_ascii_graphic() && !ch.is_ascii_whitespace() {
-                            self.target_text.push(ch);
-                        }
-                    }
-                    self.update_startup_target();
-                    return;
-                }
-                InputEvent::BackspacePressed => {
-                    self.target_text.pop();
-                    self.update_startup_target();
-                    return;
-                }
-                InputEvent::EnterPressed => {
-                    self.update_startup_target();
-                    if self.no_view {
-                        self.connected = true;
-                        self.last_error = None;
-                        log_info!("noview input armed target={}", self.target_text);
-                    }
-                    return;
-                }
-                InputEvent::KeyPressed(InputKey::Tab) => {
-                    self.toggle_startup_mode();
-                    return;
-                }
-                InputEvent::MouseButton {
-                    button: InputMouseButton::Left,
-                    state: InputButtonState::Pressed,
-                } => {
-                    if let Some(host_mode) = startup_tab_hit(
-                        self.local_width,
-                        self.local_height,
-                        self.cursor_x,
-                        self.cursor_y,
-                    ) {
-                        self.set_startup_mode(host_mode);
-                        return;
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
         match event {
             InputEvent::CursorMoved { x, y } => {
-                self.cursor_x = x.clamp(0.0, self.local_width.max(1) as f32);
-                self.cursor_y = y.clamp(0.0, self.local_height.max(1) as f32);
-                self.emit_input(INPUT_FLAG_MOTION);
+                self.cursor_x = x.clamp(0.0, self.window_width.max(1) as f32);
+                self.cursor_y = y.clamp(0.0, self.window_height.max(1) as f32);
+                self.emit_tablet(input::INPUT_FLAG_MOTION, 0);
             }
             InputEvent::MouseButton { button, state } => {
                 let bit = mouse_button_bit(button);
@@ -1177,449 +187,106 @@ impl FrameProducer for RdpViewer {
                     InputButtonState::Pressed => self.buttons_down |= bit,
                     InputButtonState::Released => self.buttons_down &= !bit,
                 }
-                self.emit_input(INPUT_FLAG_BUTTONS);
+                self.emit_tablet(input::INPUT_FLAG_BUTTONS, 0);
             }
             InputEvent::MouseWheel { x, y } => {
-                self.emit_wheel_input(x, y);
+                let wheel = if y.abs() >= x.abs() { y } else { x };
+                let wheel = wheel.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
+                if wheel != 0 {
+                    self.emit_tablet(input::INPUT_FLAG_WHEEL, wheel);
+                }
             }
             InputEvent::KeyboardInput { hid_keycode, state } => {
-                self.update_keyboard(hid_keycode, state)
+                self.update_keyboard(hid_keycode, state);
             }
             _ => {}
         }
     }
 
-    fn handle_close_requested(&mut self) -> bool {
-        log_info!(
-            "close requested; exiting without wgpu teardown frames={} textures={} rgb_draws={} tex_draws={} bytes={}",
-            self.frames,
-            self.textures,
-            self.rgb_draws,
-            self.tex_draws,
-            self.bytes_received
-        );
-        std::process::exit(0);
-    }
-
     fn build_frame(&mut self, adapter: &mut Adapter) {
-        if !self.startup_frame_presented {
-            self.draw_logo(adapter);
-            self.startup_frame_presented = true;
-            return;
+        if !self.no_view {
+            self.upload_latest_frame(adapter);
         }
 
-        if self.no_view {
-            return;
-        }
-
-        let mut drained = 0u32;
-        while drained < 512 {
-            match self.rx.try_recv() {
-                Ok(event) => {
-                    self.apply_event(adapter, event);
-                    drained += 1;
-                }
-                Err(mpsc::TryRecvError::Empty) => break,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.connected = false;
-                    break;
-                }
-            }
-        }
-        self.pending_messages = self.pending_messages.saturating_add(drained as u64);
-
-        if !self.no_view
-            && let Some(due) = self.resize_recompose_due
-        {
-            if Instant::now() >= due {
-                self.emit_recompose_request();
-                self.resize_recompose_due = None;
-            }
-        }
-
-        if !self.no_view && !self.have_frame && !self.frame_active {
-            self.draw_logo(adapter);
-        }
-    }
-}
-
-fn main() {
-    let (addr, no_view) = parse_args();
-    log_info!(
-        "starting target={} log_level={} mode={}",
-        addr,
-        configured_log_level().as_str(),
-        if no_view { "NoView" } else { "View" }
-    );
-    let (tx, rx) = mpsc::channel();
-    let (input_tx, input_rx) = mpsc::channel();
-    let target = Arc::new(Mutex::new(addr.clone()));
-    if no_view {
-        let input_target = Arc::clone(&target);
-        thread::spawn(move || hid_udp_only_sender(input_target, input_rx));
-        drop(tx);
-    } else {
-        let reader_target = Arc::clone(&target);
-        thread::spawn(move || rdp_reader(reader_target, tx, input_rx));
-    }
-
-    let producer = RdpViewer::new(rx, input_tx, target, no_view);
-    let app = WgpuWindowApp::new(
-        format!(
-            "TRUEOS RDP Viewer{} - {}",
-            if no_view { " NoView" } else { "" },
-            addr
-        ),
-        AdapterConfig::default(),
-        producer,
-    );
-    if let Err(err) = app.run() {
-        log_error!("window error: {}", err);
-    }
-}
-
-fn parse_args() -> (String, bool) {
-    let mut no_view = false;
-    let mut target = None;
-    for arg in env::args().skip(1) {
-        if arg.eq_ignore_ascii_case("-NoView")
-            || arg.eq_ignore_ascii_case("--NoView")
-            || arg.eq_ignore_ascii_case("--no-view")
-        {
-            no_view = true;
-        } else if target.is_none() {
-            target = Some(arg);
-        } else {
-            log_warn!("ignored extra arg {}", arg);
-        }
-    }
-    (target.unwrap_or_else(|| DEFAULT_ADDR.to_string()), no_view)
-}
-
-fn resolve_addr(addr: &str) -> io::Result<SocketAddr> {
-    addr.to_socket_addrs()?
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no socket address resolved"))
-}
-
-#[derive(Debug)]
-struct HidUdpSeqs {
-    keyboard: u32,
-    tablet: u32,
-}
-
-impl HidUdpSeqs {
-    fn new() -> Self {
-        let start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u32)
-            .unwrap_or(1);
-        Self {
-            keyboard: start,
-            tablet: start,
-        }
-    }
-
-    fn next_keyboard(&mut self) -> u32 {
-        self.keyboard = self.keyboard.wrapping_add(1);
-        self.keyboard
-    }
-
-    fn next_tablet(&mut self) -> u32 {
-        self.tablet = self.tablet.wrapping_add(1);
-        self.tablet
-    }
-}
-
-#[derive(Debug)]
-struct HidUdpSender {
-    socket: UdpSocket,
-    target: SocketAddr,
-}
-
-impl HidUdpSender {
-    fn connect(target: SocketAddr) -> io::Result<Self> {
-        let bind_addr = if target.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        Ok(Self {
-            socket: UdpSocket::bind(bind_addr)?,
-            target,
-        })
-    }
-
-    fn send_keyboard(&self, seq: u32, input: RdpKeyboardInput) -> io::Result<()> {
-        let payload = [
-            input.modifiers,
-            0,
-            input.keys[0],
-            input.keys[1],
-            input.keys[2],
-            input.keys[3],
-            input.keys[4],
-            input.keys[5],
-        ];
-        self.send_hid_packet(HID_UDP_KIND_KEYBOARD, 0, seq, payload.as_slice())
-    }
-
-    fn send_tablet(&self, seq: u32, input: RdpTabletInput) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(16);
-        payload.extend_from_slice(&input.x_q16.to_le_bytes());
-        payload.extend_from_slice(&input.y_q16.to_le_bytes());
-        payload.extend_from_slice(&input.buttons_down.to_le_bytes());
-        payload.extend_from_slice(&input.wheel.to_le_bytes());
-        payload.extend_from_slice(&0u16.to_le_bytes());
-        self.send_hid_packet(HID_UDP_KIND_TABLET, input.flags, seq, payload.as_slice())
-    }
-
-    fn send_hid_packet(&self, kind: u8, flags: u16, seq: u32, payload: &[u8]) -> io::Result<()> {
-        let mut packet = Vec::with_capacity(16 + payload.len());
-        packet.extend_from_slice(HID_UDP_MAGIC);
-        packet.push(HID_UDP_VERSION);
-        packet.push(kind);
-        packet.extend_from_slice(&flags.to_le_bytes());
-        packet.extend_from_slice(&seq.to_le_bytes());
-        packet.extend_from_slice(&HID_UDP_DEVICE_ID.to_le_bytes());
-        packet.extend_from_slice(&0u16.to_le_bytes());
-        packet.extend_from_slice(payload);
-        let sent = self.socket.send_to(packet.as_slice(), self.target)?;
-        static HID_PACKET_TX_LOGS: AtomicU64 = AtomicU64::new(0);
-        let n = HID_PACKET_TX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-        if should_log_count(n) {
-            let local = self
-                .socket
-                .local_addr()
-                .map(|addr| addr.to_string())
-                .unwrap_or_else(|_| "?".to_string());
-            log_info!(
-                "udp hid tx packet #{} local={} target={} kind={} seq={} flags=0x{:X} sent={} bytes={} payload={}",
-                n,
-                local,
-                self.target,
-                kind,
-                seq,
-                flags,
-                sent,
-                packet.len(),
-                payload.len()
+        let _ = adapter.begin_frame(0x000000);
+        if !self.no_view && self.have_video {
+            let vertices = aspect_fit_vertices(
+                self.window_width,
+                self.window_height,
+                self.source_width,
+                self.source_height,
+            );
+            let _ = adapter.set_sampler_raw(0, 0, 1, 1);
+            let _ = adapter.draw_tex_triangles_sample_kind_no_present(
+                VIDEO_TEXTURE_ID,
+                TextureSampleKind::Rgba,
+                &vertices,
             );
         }
-        Ok(())
+        let _ = adapter.end_frame();
     }
 }
 
-fn send_udp_hid_input(
-    hid_udp: &HidUdpSender,
-    hid_udp_seqs: &mut HidUdpSeqs,
-    input: RdpInput,
-) -> io::Result<bool> {
-    match input {
-        RdpInput::Tablet(input) => {
-            let seq = hid_udp_seqs.next_tablet();
-            hid_udp.send_tablet(seq, input)?;
-            static TABLET_TX_LOGS: AtomicU64 = AtomicU64::new(0);
-            let n = TABLET_TX_LOGS.fetch_add(1, Ordering::Relaxed) + 1;
-            if should_log_count(n) {
-                log_info!(
-                    "udp hid tx tablet #{} seq={} x_q16={} y_q16={} buttons=0x{:X} wheel={} flags=0x{:X}",
-                    n,
-                    seq,
-                    input.x_q16,
-                    input.y_q16,
-                    input.buttons_down,
-                    input.wheel,
-                    input.flags
-                );
-            }
-            Ok(true)
-        }
-        RdpInput::Keyboard(input) => {
-            hid_udp.send_keyboard(hid_udp_seqs.next_keyboard(), input)?;
-            Ok(true)
-        }
-        RdpInput::Recompose(_) | RdpInput::SnapshotAck => Ok(false),
+#[derive(Clone, Copy, Debug)]
+struct ContentRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+fn aspect_fit_rect(
+    window_width: u32,
+    window_height: u32,
+    source_width: u32,
+    source_height: u32,
+) -> ContentRect {
+    let window_width = window_width.max(1) as f32;
+    let window_height = window_height.max(1) as f32;
+    let source_width = source_width.max(1) as f32;
+    let source_height = source_height.max(1) as f32;
+    let scale = (window_width / source_width).min(window_height / source_height);
+    let width = source_width * scale;
+    let height = source_height * scale;
+    ContentRect {
+        x: (window_width - width) * 0.5,
+        y: (window_height - height) * 0.5,
+        width,
+        height,
     }
 }
 
-fn hid_udp_only_sender(target: Arc<Mutex<String>>, input_rx: Receiver<RdpInput>) {
-    let mut hid_udp_seqs = HidUdpSeqs::new();
-    let mut active_target = String::new();
-    let mut hid_udp: Option<HidUdpSender> = None;
+fn aspect_fit_vertices(
+    window_width: u32,
+    window_height: u32,
+    source_width: u32,
+    source_height: u32,
+) -> Vec<u8> {
+    let rect = aspect_fit_rect(window_width, window_height, source_width, source_height);
+    let window_width = window_width.max(1) as f32;
+    let window_height = window_height.max(1) as f32;
+    let x0 = rect.x / window_width * 2.0 - 1.0;
+    let x1 = (rect.x + rect.width) / window_width * 2.0 - 1.0;
+    let y0 = 1.0 - rect.y / window_height * 2.0;
+    let y1 = 1.0 - (rect.y + rect.height) / window_height * 2.0;
+    let vertices = [
+        (x0, y0, 0.0f32, 0.0f32),
+        (x1, y0, 1.0, 0.0),
+        (x1, y1, 1.0, 1.0),
+        (x0, y0, 0.0, 0.0),
+        (x1, y1, 1.0, 1.0),
+        (x0, y1, 0.0, 1.0),
+    ];
 
-    loop {
-        let target_text = target
-            .lock()
-            .map(|target| target.clone())
-            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-        if hid_udp.is_none() || active_target != target_text {
-            active_target = target_text.clone();
-            match resolve_addr(&target_text) {
-                Ok(addr) => match HidUdpSender::connect(addr) {
-                    Ok(sender) => {
-                        log_info!(
-                            "noview udp hid target={} device={}",
-                            addr,
-                            HID_UDP_DEVICE_ID
-                        );
-                        let probe = RdpInput::Tablet(RdpTabletInput {
-                            x_q16: 32768,
-                            y_q16: 32768,
-                            buttons_down: 0,
-                            wheel: 0,
-                            flags: INPUT_FLAG_MOTION,
-                        });
-                        if let Err(err) = send_udp_hid_input(&sender, &mut hid_udp_seqs, probe) {
-                            log_warn!("noview udp hid probe failed target={} error={}", addr, err);
-                        }
-                        hid_udp = Some(sender);
-                    }
-                    Err(err) => {
-                        log_warn!("noview udp hid unavailable target={} error={}", addr, err);
-                        hid_udp = None;
-                    }
-                },
-                Err(err) => {
-                    log_warn!("noview resolve {} failed: {}", target_text, err);
-                    hid_udp = None;
-                }
-            }
-        }
-
-        match input_rx.recv_timeout(READ_TIMEOUT) {
-            Ok(input) => {
-                if let Some(sender) = hid_udp.as_ref()
-                    && let Err(err) = send_udp_hid_input(sender, &mut hid_udp_seqs, input)
-                {
-                    log_warn!(
-                        "noview udp hid send failed target={} error={}",
-                        active_target,
-                        err
-                    );
-                    hid_udp = None;
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
-        }
-
-        if hid_udp.is_none() {
-            thread::sleep(CONNECT_RETRY_DELAY);
-        }
+    let mut bytes = Vec::with_capacity(vertices.len() * 20);
+    for (x, y, u, v) in vertices {
+        bytes.extend_from_slice(&x.to_le_bytes());
+        bytes.extend_from_slice(&y.to_le_bytes());
+        bytes.extend_from_slice(&u.to_le_bytes());
+        bytes.extend_from_slice(&v.to_le_bytes());
+        bytes.extend_from_slice(&[255, 255, 255, 255]);
     }
-}
-
-fn rdp_reader(target: Arc<Mutex<String>>, tx: Sender<RdpEvent>, input_rx: Receiver<RdpInput>) {
-    let mut hid_udp_seqs = HidUdpSeqs::new();
-    loop {
-        let addr_text = target
-            .lock()
-            .map(|target| target.clone())
-            .unwrap_or_else(|_| DEFAULT_ADDR.to_string());
-        let addr = match resolve_addr(&addr_text) {
-            Ok(addr) => addr,
-            Err(err) => {
-                log_warn!("resolve {} failed: {}", addr_text, err);
-                let _ = tx.send(RdpEvent::Disconnected(format!(
-                    "resolve {} failed: {}",
-                    addr_text, err
-                )));
-                thread::sleep(CONNECT_RETRY_DELAY);
-                continue;
-            }
-        };
-        log_info!("connecting to {}", addr);
-        match TcpStream::connect_timeout(&addr, CONNECT_RETRY_DELAY) {
-            Ok(mut stream) => {
-                log_info!("tcp connected to {}", addr);
-                let hid_udp = match HidUdpSender::connect(addr) {
-                    Ok(sender) => {
-                        log_info!("udp hid target={} device={}", addr, HID_UDP_DEVICE_ID);
-                        Some(sender)
-                    }
-                    Err(err) => {
-                        log_warn!("udp hid unavailable target={} error={}", addr, err);
-                        None
-                    }
-                };
-                let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
-                let _ = stream.set_nodelay(true);
-                let _ = tx.send(RdpEvent::Connected);
-                if let Err(err) = read_stream(
-                    &mut stream,
-                    &tx,
-                    &input_rx,
-                    hid_udp.as_ref(),
-                    &mut hid_udp_seqs,
-                ) {
-                    log_warn!("read loop ended: {}", err);
-                    let _ = tx.send(RdpEvent::Disconnected(err.to_string()));
-                }
-                thread::sleep(CONNECT_RETRY_DELAY);
-            }
-            Err(err) => {
-                log_warn!("connect {} failed: {}", addr, err);
-                let _ = tx.send(RdpEvent::Disconnected(format!(
-                    "connect {} failed: {}",
-                    addr, err
-                )));
-                thread::sleep(CONNECT_RETRY_DELAY);
-            }
-        }
-    }
-}
-
-fn read_stream(
-    stream: &mut TcpStream,
-    tx: &Sender<RdpEvent>,
-    input_rx: &Receiver<RdpInput>,
-    hid_udp: Option<&HidUdpSender>,
-    hid_udp_seqs: &mut HidUdpSeqs,
-) -> io::Result<()> {
-    let mut frames = 0u64;
-    let mut bytes = 0u64;
-    loop {
-        let mut len_buf = [0u8; 4];
-        read_exact_retry_timeout(stream, &mut len_buf, input_rx, hid_udp, hid_udp_seqs)?;
-        let len = u32::from_le_bytes(len_buf) as usize;
-        if len > MAX_FRAME_BYTES {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("rdp frame too large: {}", len),
-            ));
-        }
-
-        let mut payload = vec![0u8; len];
-        read_exact_retry_timeout(stream, &mut payload, input_rx, hid_udp, hid_udp_seqs)?;
-        frames = frames.saturating_add(1);
-        bytes = bytes.saturating_add(len as u64);
-        if should_log_count(frames) {
-            log_trace!(
-                "wire frame={} payload_bytes={} total_payload_bytes={}",
-                frames,
-                len,
-                bytes
-            );
-        }
-        match parse_payload(&payload) {
-            Ok(Some(msg)) => {
-                if tx.send(RdpEvent::Message(msg)).is_err() {
-                    return Ok(());
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                log_error!("parse error after {} wire frames: {}", frames, err);
-                let _ = tx.send(RdpEvent::Disconnected(err.to_string()));
-                return Err(io::Error::new(io::ErrorKind::InvalidData, err));
-            }
-        }
-    }
-}
-
-fn should_log_count(count: u64) -> bool {
-    count <= DETAILED_LOG_LIMIT || count.is_power_of_two() || count.is_multiple_of(120)
+    bytes
 }
 
 fn norm_to_q16(value: f32) -> u32 {
@@ -1638,1059 +305,151 @@ fn mouse_button_bit(button: InputMouseButton) -> u32 {
     }
 }
 
-fn read_exact_retry_timeout(
-    stream: &mut TcpStream,
-    mut buf: &mut [u8],
-    input_rx: &Receiver<RdpInput>,
-    hid_udp: Option<&HidUdpSender>,
-    hid_udp_seqs: &mut HidUdpSeqs,
-) -> io::Result<()> {
-    while !buf.is_empty() {
-        drain_input(stream, input_rx, hid_udp, hid_udp_seqs)?;
-        match stream.read(buf) {
-            Ok(0) => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "tcp eof")),
-            Ok(n) => {
-                let tmp = buf;
-                buf = &mut tmp[n..];
-            }
-            Err(err)
-                if err.kind() == io::ErrorKind::WouldBlock
-                    || err.kind() == io::ErrorKind::TimedOut =>
-            {
-                drain_input(stream, input_rx, hid_udp, hid_udp_seqs)?;
-                continue;
-            }
-            Err(err) => return Err(err),
+fn parse_args() -> Result<Option<AppConfig>, String> {
+    let mut host = None;
+    let mut no_view = false;
+    for arg in env::args().skip(1) {
+        if arg == "-h" || arg == "--help" {
+            return Ok(None);
+        }
+        if arg.eq_ignore_ascii_case("-NoView")
+            || arg.eq_ignore_ascii_case("--NoView")
+            || arg.eq_ignore_ascii_case("--no-view")
+        {
+            no_view = true;
+        } else if host.is_none() {
+            host = Some(strip_port(&arg).to_string());
+        } else {
+            return Err(format!("unexpected argument: {arg}"));
         }
     }
-    Ok(())
+    Ok(Some(AppConfig {
+        host: host.unwrap_or_else(|| DEFAULT_HOST.to_string()),
+        no_view,
+    }))
 }
 
-fn drain_input(
-    stream: &mut TcpStream,
-    input_rx: &Receiver<RdpInput>,
-    hid_udp: Option<&HidUdpSender>,
-    hid_udp_seqs: &mut HidUdpSeqs,
-) -> io::Result<()> {
-    loop {
-        match input_rx.try_recv() {
-            Ok(RdpInput::Tablet(input)) => {
-                if let Some(hid_udp) = hid_udp {
-                    hid_udp.send_tablet(hid_udp_seqs.next_tablet(), input)?;
-                }
-            }
-            Ok(RdpInput::Keyboard(input)) => {
-                if let Some(hid_udp) = hid_udp {
-                    hid_udp.send_keyboard(hid_udp_seqs.next_keyboard(), input)?;
-                }
-            }
-            Ok(RdpInput::Recompose(input)) => {
-                let frame = encode_recompose_input_frame(input);
-                stream.write_all(frame.as_slice())?;
-            }
-            Ok(RdpInput::SnapshotAck) => {
-                let frame = encode_snapshot_ack_input_frame();
-                stream.write_all(frame.as_slice())?;
-            }
-            Err(mpsc::TryRecvError::Empty) => return Ok(()),
-            Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-        }
+fn strip_port(target: &str) -> &str {
+    let target = target.trim();
+    if target.starts_with('[')
+        && let Some(end) = target.find(']')
+    {
+        return &target[1..end];
     }
+    if target.parse::<IpAddr>().is_ok() {
+        return target;
+    }
+    if let Some((host, port)) = target.rsplit_once(':')
+        && port.parse::<u16>().is_ok()
+    {
+        return host;
+    }
+    target
 }
 
-fn encode_recompose_input_frame(input: RdpRecomposeInput) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8 + 12);
-    payload.extend_from_slice(b"TRDP");
-    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    payload.extend_from_slice(&MSG_CLIENT_RECOMPOSE.to_le_bytes());
-    payload.extend_from_slice(&input.width.to_le_bytes());
-    payload.extend_from_slice(&input.height.to_le_bytes());
-    payload.extend_from_slice(&0u32.to_le_bytes());
-
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload.as_slice());
-    frame
+fn resolve(host: &str, port: u16) -> io::Result<SocketAddr> {
+    (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "host resolved no addresses"))
 }
 
-fn encode_snapshot_ack_input_frame() -> Vec<u8> {
-    let mut payload = Vec::with_capacity(8);
-    payload.extend_from_slice(b"TRDP");
-    payload.extend_from_slice(&PROTOCOL_VERSION.to_le_bytes());
-    payload.extend_from_slice(&MSG_RESOURCE_SNAPSHOT_ACK.to_le_bytes());
-
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-    frame.extend_from_slice(payload.as_slice());
-    frame
+fn usage() {
+    eprintln!(
+        "TRUEOS Remote Desktop\n\n\
+         Usage: trueos-rdp [HOST|HOST:PORT] [--no-view]\n\n\
+         HOST defaults to {DEFAULT_HOST}. Input always uses UDP port {INPUT_PORT}; \
+         video uses UDP port {MEDIA_PORT}. --no-view preserves input-only mode."
+    );
 }
 
-fn parse_payload(payload: &[u8]) -> Result<Option<RdpMessage>, String> {
-    if payload.len() < 8 {
-        return Err("short rdp payload".to_string());
-    }
-    if &payload[..4] != b"TRDP" {
-        return Err("bad rdp magic".to_string());
-    }
-    let version = u16::from_le_bytes(payload[4..6].try_into().unwrap());
-    if version != PROTOCOL_VERSION {
-        return Err(format!("unsupported rdp protocol {}", version));
-    }
-    let msg = u16::from_le_bytes(payload[6..8].try_into().unwrap());
-    let body = &payload[8..];
-    let fields = field_count(msg)?;
-    let field_bytes = fields
-        .checked_mul(4)
-        .ok_or_else(|| "rdp field table overflow".to_string())?;
-    if body.len() < field_bytes {
-        return Err(format!("short rdp message {}", msg));
-    }
-    let f = |idx: usize| -> u32 {
-        let off = idx * 4;
-        u32::from_le_bytes(body[off..off + 4].try_into().unwrap())
+fn run(config: AppConfig) -> Result<(), String> {
+    let input_target = resolve(&config.host, INPUT_PORT)
+        .map_err(|error| format!("cannot resolve input target: {error}"))?;
+    let media_target = resolve(&config.host, MEDIA_PORT)
+        .map_err(|error| format!("cannot resolve media target: {error}"))?;
+    let (input_tx, input_rx): (Sender<RemoteInput>, Receiver<RemoteInput>) = mpsc::channel();
+    input::spawn_sender(input_target, input_rx);
+
+    let media = if config.no_view {
+        None
+    } else {
+        Some(
+            MediaFeed::spawn(MediaConfig::new(media_target))
+                .map_err(|error| format!("cannot start media receiver: {error}"))?,
+        )
     };
-    let data = &body[field_bytes..];
 
-    let parsed = match msg {
-        MSG_HELLO => RdpMessage::Hello {
-            width: f(0),
-            height: f(1),
-            caps: f(2),
-        },
-        MSG_BEGIN_FRAME => RdpMessage::BeginFrame {
-            seq: f(0),
-            flags: f(1),
-            clear_rgb: f(2),
-        },
-        MSG_END_FRAME => RdpMessage::EndFrame {
-            seq: f(0),
-            flags: f(1),
-        },
-        MSG_SET_BLEND => RdpMessage::SetBlend {
-            seq: f(0),
-            enabled: f(1),
-            src_rgb: f(2),
-            dst_rgb: f(3),
-        },
-        MSG_SET_SAMPLER => RdpMessage::SetSampler {
-            seq: f(0),
-            wrap_s: f(1),
-            wrap_t: f(2),
-            min_filter: f(3),
-            mag_filter: f(4),
-        },
-        MSG_SET_SCISSOR => RdpMessage::SetScissor {
-            seq: f(0),
-            x: f(1),
-            y: f(2),
-            width: f(3),
-            height: f(4),
-        },
-        MSG_CLEAR_SCISSOR => RdpMessage::ClearScissor { seq: f(0) },
-        MSG_SET_RENDER_TARGET => RdpMessage::SetRenderTarget {
-            seq: f(0),
-            tex_id: f(1),
-        },
-        MSG_CLEAR_RENDER_TARGET => RdpMessage::ClearRenderTarget { seq: f(0) },
-        MSG_CLEAR_RECT => RdpMessage::ClearRect {
-            seq: f(0),
-            rgb: f(1),
-            x: f(2),
-            y: f(3),
-            width: f(4),
-            height: f(5),
-        },
-        MSG_CLEAR_COLOR_RGBA => RdpMessage::ClearColorRgba {
-            seq: f(0),
-            r: f(1),
-            g: f(2),
-            b: f(3),
-            a: f(4),
-        },
-        MSG_TEXTURE_RGBA => {
-            let region = if f(6) != 0 && f(7) != 0 {
-                Some((f(4), f(5), f(6), f(7)))
-            } else {
-                None
-            };
-            let expected = if let Some((_, _, rw, rh)) = region {
-                checked_rgba_len(rw, rh)?
-            } else {
-                checked_rgba_len(f(1), f(2))?
-            };
-            if data.len() < expected {
-                return Err(format!(
-                    "short rgba texture {}: got {}, expected {}",
-                    f(0),
-                    data.len(),
-                    expected
-                ));
-            }
-            RdpMessage::TextureRgba {
-                tex_id: f(0),
-                width: f(1),
-                height: f(2),
-                region,
-                rgba: data[..expected].to_vec(),
-            }
+    eprintln!(
+        "trueos-rdp: host={} input={} media={} mode={}",
+        config.host,
+        input_target,
+        media_target,
+        if config.no_view {
+            "input-only"
+        } else {
+            "video+input"
         }
-        MSG_TEXTURE_PNG => RdpMessage::TexturePng {
-            tex_id: f(0),
-            bytes: data.to_vec(),
+    );
+
+    let viewer = Viewer::new(media, input_tx, config.no_view);
+    let app = WgpuWindowApp::new(
+        format!("TRUEOS Remote Desktop — {}", config.host),
+        AdapterConfig {
+            width: INITIAL_WINDOW_WIDTH,
+            height: INITIAL_WINDOW_HEIGHT,
         },
-        MSG_TEXTURE_JPEG => RdpMessage::TextureJpeg {
-            tex_id: f(0),
-            bytes: data.to_vec(),
-        },
-        MSG_TEXTURE_SVG => RdpMessage::TextureSvg {
-            tex_id: f(0),
-            bytes: data.len(),
-        },
-        MSG_DRAW_RGB_TRIANGLES => RdpMessage::DrawRgb {
-            seq: f(0),
-            bytes: data.to_vec(),
-        },
-        MSG_DRAW_TEX_TRIANGLES => RdpMessage::DrawTex {
-            seq: f(0),
-            tex_id: f(1),
-            sampler_flags: f(3),
-            sample_kind: TextureSampleKind::from_raw(f(4)),
-            bytes: data.to_vec(),
-        },
-        MSG_SHADER_CREATE => {
-            let expected = f(4) as usize;
-            if data.len() < expected {
-                return Err(format!(
-                    "short shader {}: got {}, expected {}",
-                    f(0),
-                    data.len(),
-                    expected
-                ));
-            }
-            RdpMessage::ShaderCreate {
-                shader_id: f(0),
-                stage: f(1),
-                format: f(2),
-                flags: f(3),
-                bytes: data[..expected].to_vec(),
-            }
-        }
-        MSG_PIPELINE_CREATE => RdpMessage::PipelineCreate {
-            pipeline_id: f(0),
-            stride: f(1),
-            pos_offset: f(2),
-            color_offset: f(3),
-            color_format: f(4),
-            texcoord_offset: f(5),
-            texcoord_format: f(6),
-            vs_shader_id: f(7),
-            fs_shader_id: f(8),
-        },
-        MSG_DRAW_PIPELINE_TRIANGLES => {
-            let expected = f(3) as usize;
-            if data.len() < expected {
-                return Err(format!(
-                    "short pipeline draw {}: got {}, expected {}",
-                    f(1),
-                    data.len(),
-                    expected
-                ));
-            }
-            RdpMessage::DrawPipeline {
-                seq: f(0),
-                pipeline_id: f(1),
-                bytes: data[..expected].to_vec(),
-            }
-        }
-        MSG_RESOURCE_SNAPSHOT_BEGIN => RdpMessage::SnapshotBegin {
-            textures: f(0),
-            bytes: f(1),
-        },
-        MSG_RESOURCE_SNAPSHOT_END => RdpMessage::SnapshotEnd,
-        _ => return Ok(None),
-    };
-    Ok(Some(parsed))
+        viewer,
+    );
+    app.run().map_err(|error| error.to_string())
 }
 
-fn field_count(msg: u16) -> Result<usize, String> {
-    match msg {
-        MSG_HELLO => Ok(3),
-        MSG_BEGIN_FRAME => Ok(3),
-        MSG_END_FRAME => Ok(5),
-        MSG_SET_BLEND => Ok(6),
-        MSG_SET_SAMPLER => Ok(5),
-        MSG_SET_SCISSOR => Ok(5),
-        MSG_CLEAR_SCISSOR => Ok(1),
-        MSG_SET_RENDER_TARGET => Ok(2),
-        MSG_CLEAR_RENDER_TARGET => Ok(1),
-        MSG_CLEAR_RECT => Ok(6),
-        MSG_CLEAR_COLOR_RGBA => Ok(5),
-        MSG_TEXTURE_RGBA => Ok(9),
-        MSG_TEXTURE_PNG | MSG_TEXTURE_JPEG | MSG_TEXTURE_SVG => Ok(3),
-        MSG_DRAW_RGB_TRIANGLES => Ok(3),
-        MSG_DRAW_TEX_TRIANGLES => Ok(6),
-        MSG_SHADER_CREATE => Ok(5),
-        MSG_PIPELINE_CREATE => Ok(9),
-        MSG_DRAW_PIPELINE_TRIANGLES => Ok(4),
-        MSG_RESOURCE_SNAPSHOT_BEGIN | MSG_RESOURCE_SNAPSHOT_END => Ok(3),
-        _ => Err(format!("unknown rdp message {}", msg)),
-    }
-}
-
-fn checked_rgba_len(width: u32, height: u32) -> Result<usize, String> {
-    (width as usize)
-        .checked_mul(height as usize)
-        .and_then(|px| px.checked_mul(4))
-        .ok_or_else(|| format!("rgba texture dimensions overflow {}x{}", width, height))
-}
-
-fn decode_png_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let decoder = png::Decoder::new(Cursor::new(bytes));
-    let mut reader = decoder.read_info().map_err(|err| err.to_string())?;
-    let out_size = reader
-        .output_buffer_size()
-        .ok_or_else(|| "png output buffer size overflow".to_string())?;
-    let mut buf = vec![0u8; out_size];
-    let info = reader.next_frame(&mut buf).map_err(|err| err.to_string())?;
-    let src = &buf[..info.buffer_size()];
-    let rgba = match (info.color_type, info.bit_depth) {
-        (png::ColorType::Rgba, png::BitDepth::Eight) => src.to_vec(),
-        (png::ColorType::Rgb, png::BitDepth::Eight) => {
-            let mut out = Vec::with_capacity(src.len() / 3 * 4);
-            for rgb in src.chunks_exact(3) {
-                out.extend_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
-            }
-            out
-        }
-        (png::ColorType::Grayscale, png::BitDepth::Eight) => {
-            let mut out = Vec::with_capacity(src.len() * 4);
-            for &g in src {
-                out.extend_from_slice(&[g, g, g, 255]);
-            }
-            out
-        }
-        (png::ColorType::GrayscaleAlpha, png::BitDepth::Eight) => {
-            let mut out = Vec::with_capacity(src.len() / 2 * 4);
-            for ga in src.chunks_exact(2) {
-                out.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
-            }
-            out
-        }
-        other => return Err(format!("unsupported png format {:?}", other)),
-    };
-    Ok((info.width, info.height, rgba))
-}
-
-fn decode_jpeg_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let options = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::RGBA)
-        .set_use_unsafe(true);
-    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    decoder.decode_headers().map_err(|err| err.to_string())?;
-    let info = decoder
-        .info()
-        .ok_or_else(|| "jpeg missing image info".to_string())?;
-    let width = u32::from(info.width);
-    let height = u32::from(info.height);
-    if width == 0 || height == 0 {
-        return Err("jpeg has zero-sized image".to_string());
-    }
-    let rgba = decoder.decode().map_err(|err| err.to_string())?;
-    let expected = checked_rgba_len(width, height)?;
-    if rgba.len() != expected {
-        return Err(format!(
-            "jpeg decoded size mismatch got {}, expected {}",
-            rgba.len(),
-            expected
-        ));
-    }
-    Ok((width, height, rgba))
-}
-
-fn upload_svg_placeholder(adapter: &mut Adapter, tex_id: u32) {
-    const W: u32 = 64;
-    const H: u32 = 64;
-    let mut rgba = Vec::with_capacity((W * H * 4) as usize);
-    for y in 0..H {
-        for x in 0..W {
-            let checker = ((x / 8) + (y / 8)) % 2 == 0;
-            if checker {
-                rgba.extend_from_slice(&[255, 0, 255, 255]);
-            } else {
-                rgba.extend_from_slice(&[32, 0, 32, 255]);
-            }
-        }
-    }
-    let _ = adapter.upload_texture_rgba_image(tex_id, W, H, &rgba);
-}
-
-fn apply_sampler_flags(adapter: &mut Adapter, flags: u32) {
-    let wrap_s = flags & 0xFF;
-    let wrap_t = (flags >> 8) & 0xFF;
-    let min_filter = (flags >> 16) & 0xFF;
-    let mag_filter = (flags >> 24) & 0xFF;
-    let _ = adapter.set_sampler_raw(wrap_s, wrap_t, min_filter, mag_filter);
-}
-
-fn upload_texture_rgba(
-    adapter: &mut Adapter,
-    tex_id: u32,
-    width: u32,
-    height: u32,
-    region: Option<(u32, u32, u32, u32)>,
-    rgba: &[u8],
-) {
-    let Some((rx, ry, rw, rh)) = region else {
-        let _ = adapter.upload_texture_rgba_image(tex_id, width, height, rgba);
-        return;
-    };
-    if rw == 0 || rh == 0 {
-        return;
-    }
-
-    let Ok(full_len) = checked_rgba_len(width, height) else {
-        return;
-    };
-    let mut full = adapter
-        .textures()
-        .image(tex_id)
-        .filter(|image| image.width == width && image.height == height)
-        .map(|image| image.rgba.clone())
-        .unwrap_or_else(|| vec![0u8; full_len]);
-
-    if full.len() != full_len || rx.saturating_add(rw) > width || ry.saturating_add(rh) > height {
-        return;
-    }
-
-    let row_bytes = (rw as usize).saturating_mul(4);
-    for row in 0..rh as usize {
-        let src = row.saturating_mul(row_bytes);
-        let dst = ((ry as usize + row) * width as usize + rx as usize).saturating_mul(4);
-        if src + row_bytes > rgba.len() || dst + row_bytes > full.len() {
+fn main() {
+    let config = match parse_args() {
+        Ok(Some(config)) => config,
+        Ok(None) => {
+            usage();
             return;
         }
-        full[dst..dst + row_bytes].copy_from_slice(&rgba[src..src + row_bytes]);
-    }
-    let _ = adapter.upload_texture_rgba_image(tex_id, width, height, &full);
-}
-
-fn draw_clear_rect(adapter: &mut Adapter, rgb: u32, x: u32, y: u32, width: u32, height: u32) {
-    if width == 0 || height == 0 {
-        return;
-    }
-    let x0 = x as f32;
-    let y0 = y as f32;
-    let x1 = x.saturating_add(width) as f32;
-    let y1 = y.saturating_add(height) as f32;
-    let r = ((rgb >> 16) & 0xFF) as u8;
-    let g = ((rgb >> 8) & 0xFF) as u8;
-    let b = (rgb & 0xFF) as u8;
-    let vertices = [
-        (x0, y0, r, g, b, 255),
-        (x1, y0, r, g, b, 255),
-        (x1, y1, r, g, b, 255),
-        (x0, y0, r, g, b, 255),
-        (x1, y1, r, g, b, 255),
-        (x0, y1, r, g, b, 255),
-    ];
-    let mut bytes = Vec::with_capacity(vertices.len() * 12);
-    for (x, y, r, g, b, a) in vertices {
-        bytes.extend_from_slice(&x.to_le_bytes());
-        bytes.extend_from_slice(&y.to_le_bytes());
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
-}
-
-fn draw_startup_panel(
-    adapter: &mut Adapter,
-    width: u32,
-    height: u32,
-    target: &str,
-    status: Option<&str>,
-    elapsed: Duration,
-) {
-    let width = width.max(1) as f32;
-    let height = height.max(1) as f32;
-    let scale: f32 = if width < 720.0 { 2.0 } else { 3.0 };
-    let ui_scale = (width / 760.0).clamp(0.72, 1.25);
-    let (host, _port) = split_target(target);
-    let host_mode = !looks_like_ip(host);
-
-    let stroke = 3.0 * ui_scale;
-    let gap = 12.0 * ui_scale;
-    let pad = 30.0 * ui_scale;
-    let label_scale = (scale * 0.72).max(1.5);
-    let line_scale = (scale * 1.18).max(2.5);
-    let value_scale = line_scale;
-    let tab_scale = line_scale;
-    let border_color = 0x6f767d;
-    let selected_color = 0xff37ff;
-    let label_h = 7.0 * label_scale;
-    let label_gap = 8.0 * ui_scale;
-    let input_h = 56.0 * ui_scale;
-    let base_content_w = 730.0 * ui_scale - 2.0 * pad;
-    let input_w = base_content_w * 0.43;
-    let tab_w = base_content_w * 0.22;
-    let row_w = input_w + gap + tab_w;
-    let panel_w = (row_w + 2.0 * (gap + stroke)).min(width - 24.0).max(360.0);
-    let panel_h = pad + input_h + gap + stroke;
-    let x0 = (width - panel_w) * 0.5;
-    let y0 = pad.min((height - panel_h - 72.0).max(18.0));
-    let x1 = x0 + panel_w;
-    let y1 = y0 + panel_h;
-
-    let mut bytes = Vec::new();
-
-    push_px_rect_alpha(
-        &mut bytes,
-        width,
-        height,
-        x0 + stroke,
-        y0 + stroke,
-        x1 - stroke,
-        y1 - stroke,
-        0xf8fbff,
-        128,
-    );
-    let label_y = y0 + pad - label_gap - label_h;
-    let content_x0 = x0 + gap + stroke;
-    let input_x0 = content_x0;
-    let input_y0 = y0 + pad;
-    let input_x1 = input_x0 + input_w;
-    let tab_x0 = input_x1 + gap;
-    let tab_mid = tab_x0 + tab_w * 0.34;
-    let tab_y1 = input_y0 + input_h;
-
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        input_x0,
-        label_y,
-        label_scale,
-        "TYPE",
-        0x111111,
-    );
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        tab_x0,
-        label_y,
-        label_scale,
-        "TAB",
-        0x111111,
-    );
-
-    draw_stroked_box(
-        &mut bytes,
-        width,
-        height,
-        input_x0,
-        input_y0,
-        input_x1,
-        tab_y1,
-        stroke,
-        border_color,
-        0xffffff,
-    );
-    draw_stroked_box(
-        &mut bytes,
-        width,
-        height,
-        tab_x0,
-        input_y0,
-        tab_x0 + tab_w,
-        tab_y1,
-        stroke,
-        border_color,
-        0xffffff,
-    );
-    let selected_x0 = if host_mode { tab_mid } else { tab_x0 + stroke };
-    let selected_x1 = if host_mode {
-        tab_x0 + tab_w - stroke
-    } else {
-        tab_mid
+        Err(error) => {
+            eprintln!("trueos-rdp: {error}");
+            usage();
+            std::process::exit(2);
+        }
     };
-    push_px_rect_alpha(
-        &mut bytes,
-        width,
-        height,
-        selected_x0,
-        input_y0 + stroke,
-        selected_x1,
-        tab_y1 - stroke,
-        selected_color,
-        255,
-    );
-    push_px_rect(
-        &mut bytes,
-        width,
-        height,
-        tab_mid - stroke * 0.5,
-        input_y0,
-        tab_mid + stroke * 0.5,
-        tab_y1,
-        border_color,
-    );
-
-    let host_visible = fit_ascii_text(
-        host,
-        ((input_x1 - input_x0 - 36.0 * ui_scale) / (6.0 * value_scale)).max(1.0) as usize,
-    );
-    let value_y = input_y0 + (input_h - 7.0 * value_scale) * 0.5;
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        input_x0 + 24.0 * ui_scale,
-        value_y,
-        value_scale,
-        &host_visible,
-        0x000000,
-    );
-    let port_label = "PORT 100";
-    let port_scale = label_scale;
-    let port_w = port_label.chars().count() as f32 * 6.0 * port_scale;
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        input_x1 - port_w - 10.0 * ui_scale,
-        tab_y1 - 22.0 * ui_scale,
-        port_scale,
-        &port_label,
-        0x000000,
-    );
-
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        center_text_x(tab_x0, tab_mid, "IP", tab_scale),
-        value_y,
-        tab_scale,
-        "IP",
-        0x000000,
-    );
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        center_text_x(tab_mid, tab_x0 + tab_w, "HOST", tab_scale),
-        value_y,
-        tab_scale,
-        "HOST",
-        0x000000,
-    );
-
-    let line = startup_status_line(status, elapsed);
-    let line_w = line.chars().count() as f32 * 6.0 * line_scale;
-    let line_x = (width - line_w) * 0.5;
-    let line_y = (height - pad - 7.0 * line_scale).max(y1 + pad);
-    push_text(
-        &mut bytes,
-        width,
-        height,
-        line_x + 1.0,
-        line_y + 1.0,
-        line_scale,
-        &line,
-        0xf8fbff,
-    );
-    push_text(
-        &mut bytes, width, height, line_x, line_y, line_scale, &line, 0x000000,
-    );
-
-    let _ = adapter.set_blend_raw(1, 0x0302, 0x0303);
-    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
-    let _ = adapter.set_blend_raw(0, 1, 0);
-}
-
-fn draw_stroked_box(
-    bytes: &mut Vec<u8>,
-    width: f32,
-    height: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    stroke: f32,
-    border: u32,
-    fill: u32,
-) {
-    push_px_rect(bytes, width, height, x0, y0, x1, y1, border);
-    push_px_rect(
-        bytes,
-        width,
-        height,
-        x0 + stroke,
-        y0 + stroke,
-        x1 - stroke,
-        y1 - stroke,
-        fill,
-    );
-}
-
-fn split_target(target: &str) -> (&str, Option<&str>) {
-    let trimmed = target.trim();
-    let Some((host, port)) = trimmed.rsplit_once(':') else {
-        return (trimmed, None);
-    };
-    if port.chars().all(|ch| ch.is_ascii_digit()) {
-        (host, Some(port))
-    } else {
-        (trimmed, None)
+    if let Err(error) = run(config) {
+        eprintln!("trueos-rdp: {error}");
+        std::process::exit(1);
     }
 }
 
-fn looks_like_ip(host: &str) -> bool {
-    let mut parts = 0usize;
-    for part in host.split('.') {
-        if part.is_empty() || part.len() > 3 || !part.chars().all(|ch| ch.is_ascii_digit()) {
-            return false;
-        }
-        if part.parse::<u8>().is_err() {
-            return false;
-        }
-        parts += 1;
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn letterboxes_wide_source_in_tall_window() {
+        let rect = aspect_fit_rect(800, 800, 1920, 1088);
+        assert_eq!(rect.x, 0.0);
+        assert!(rect.y > 170.0);
+        assert_eq!(rect.width, 800.0);
+        assert!(rect.height > 453.0 && rect.height < 454.0);
     }
-    parts == 4
-}
 
-fn startup_tab_hit(width: u32, height: u32, x: f32, y: f32) -> Option<bool> {
-    let width = width.max(1) as f32;
-    let height = height.max(1) as f32;
-    let scale: f32 = if width < 720.0 { 2.0 } else { 3.0 };
-    let ui_scale = (width / 760.0).clamp(0.72, 1.25);
-
-    let stroke = 3.0 * ui_scale;
-    let gap = 12.0 * ui_scale;
-    let pad = 30.0 * ui_scale;
-    let line_scale = (scale * 1.18).max(2.5);
-    let input_h = 56.0 * ui_scale;
-    let base_content_w = 730.0 * ui_scale - 2.0 * pad;
-    let input_w = base_content_w * 0.43;
-    let tab_w = base_content_w * 0.22;
-    let row_w = input_w + gap + tab_w;
-    let panel_w = (row_w + 2.0 * (gap + stroke)).min(width - 24.0).max(360.0);
-    let panel_h = pad + input_h + gap + stroke;
-    let x0 = (width - panel_w) * 0.5;
-    let y0 = pad.min((height - panel_h - 72.0).max(18.0));
-    let content_x0 = x0 + gap + stroke;
-    let input_x0 = content_x0;
-    let input_y0 = y0 + pad;
-    let input_x1 = input_x0 + input_w;
-    let tab_x0 = input_x1 + gap;
-    let tab_mid = tab_x0 + tab_w * 0.34;
-    let tab_x1 = tab_x0 + tab_w;
-    let tab_y1 = input_y0 + input_h;
-    let _ = line_scale;
-
-    if y < input_y0 || y > tab_y1 || x < tab_x0 || x > tab_x1 {
-        return None;
+    #[test]
+    fn pillarboxes_wide_window() {
+        let rect = aspect_fit_rect(2560, 1088, 1920, 1088);
+        assert_eq!(rect.y, 0.0);
+        assert_eq!(rect.height, 1088.0);
+        assert_eq!(rect.width, 1920.0);
+        assert_eq!(rect.x, 320.0);
     }
-    Some(x >= tab_mid)
-}
 
-fn startup_status_line(status: Option<&str>, elapsed: Duration) -> String {
-    if let Some(status) = status {
-        if status.starts_with("connected") {
-            return status.to_string();
-        }
+    #[test]
+    fn accepts_host_or_legacy_host_port() {
+        assert_eq!(strip_port("192.168.178.94"), "192.168.178.94");
+        assert_eq!(strip_port("192.168.178.94:100"), "192.168.178.94");
+        assert_eq!(strip_port("trueos.eu:100"), "trueos.eu");
+        assert_eq!(strip_port("[::1]:100"), "::1");
     }
-    let phase = 3u64.saturating_sub(elapsed.as_secs() % 4);
-    if phase == 0 {
-        "Autoconnect ...".to_string()
-    } else {
-        format!(
-            "Autoconnect {} {} {} ...",
-            phase,
-            phase.saturating_sub(1),
-            phase.saturating_sub(2)
-        )
-    }
-}
-
-fn fit_ascii_text(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        return text.to_string();
-    }
-    let keep = max_chars.saturating_sub(3);
-    format!(
-        "...{}",
-        text.chars()
-            .skip(count.saturating_sub(keep))
-            .collect::<String>()
-    )
-}
-
-fn center_text_x(x0: f32, x1: f32, text: &str, scale: f32) -> f32 {
-    let text_w = text.chars().count() as f32 * 6.0 * scale;
-    x0 + (x1 - x0 - text_w).max(0.0) * 0.5
-}
-
-fn push_text(
-    bytes: &mut Vec<u8>,
-    width: f32,
-    height: f32,
-    x: f32,
-    y: f32,
-    scale: f32,
-    text: &str,
-    rgb: u32,
-) {
-    let mut cursor = x;
-    for ch in text.chars() {
-        push_glyph(bytes, width, height, cursor, y, scale, ch, rgb);
-        cursor += 6.0 * scale;
-    }
-}
-
-fn push_glyph(
-    bytes: &mut Vec<u8>,
-    width: f32,
-    height: f32,
-    x: f32,
-    y: f32,
-    scale: f32,
-    ch: char,
-    rgb: u32,
-) {
-    let glyph = glyph_bits(ch);
-    for (row, bits) in glyph.iter().enumerate() {
-        for col in 0..5 {
-            if bits & (1 << (4 - col)) != 0 {
-                let px = x + col as f32 * scale;
-                let py = y + row as f32 * scale;
-                push_px_rect(bytes, width, height, px, py, px + scale, py + scale, rgb);
-            }
-        }
-    }
-}
-
-fn push_px_rect(
-    bytes: &mut Vec<u8>,
-    width: f32,
-    height: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    rgb: u32,
-) {
-    push_px_rect_alpha(bytes, width, height, x0, y0, x1, y1, rgb, 255);
-}
-
-fn push_px_rect_alpha(
-    bytes: &mut Vec<u8>,
-    width: f32,
-    height: f32,
-    x0: f32,
-    y0: f32,
-    x1: f32,
-    y1: f32,
-    rgb: u32,
-    alpha: u8,
-) {
-    let x0 = px_to_clip_x(x0, width);
-    let y0 = px_to_clip_y(y0, height);
-    let x1 = px_to_clip_x(x1, width);
-    let y1 = px_to_clip_y(y1, height);
-    let r = ((rgb >> 16) & 0xFF) as u8;
-    let g = ((rgb >> 8) & 0xFF) as u8;
-    let b = (rgb & 0xFF) as u8;
-    let vertices = [
-        (x0, y0, r, g, b, alpha),
-        (x1, y0, r, g, b, alpha),
-        (x1, y1, r, g, b, alpha),
-        (x0, y0, r, g, b, alpha),
-        (x1, y1, r, g, b, alpha),
-        (x0, y1, r, g, b, alpha),
-    ];
-    for (x, y, r, g, b, a) in vertices {
-        bytes.extend_from_slice(&x.to_le_bytes());
-        bytes.extend_from_slice(&y.to_le_bytes());
-        bytes.extend_from_slice(&[r, g, b, a]);
-    }
-}
-
-fn px_to_clip_x(x: f32, width: f32) -> f32 {
-    x / width.max(1.0) * 2.0 - 1.0
-}
-
-fn px_to_clip_y(y: f32, height: f32) -> f32 {
-    1.0 - y / height.max(1.0) * 2.0
-}
-
-fn glyph_bits(ch: char) -> [u8; 7] {
-    match ch.to_ascii_lowercase() {
-        'a' => [
-            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'b' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
-        ],
-        'c' => [
-            0b01110, 0b10001, 0b10000, 0b10000, 0b10000, 0b10001, 0b01110,
-        ],
-        'd' => [
-            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
-        ],
-        'e' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
-        ],
-        'f' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'g' => [
-            0b01110, 0b10001, 0b10000, 0b10111, 0b10001, 0b10001, 0b01110,
-        ],
-        'h' => [
-            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
-        ],
-        'i' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
-        ],
-        'j' => [
-            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
-        ],
-        'k' => [
-            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
-        ],
-        'l' => [
-            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
-        ],
-        'm' => [
-            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
-        ],
-        'n' => [
-            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
-        ],
-        'o' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'p' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
-        ],
-        'q' => [
-            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
-        ],
-        'r' => [
-            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
-        ],
-        's' => [
-            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        't' => [
-            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'u' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
-        ],
-        'v' => [
-            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
-        ],
-        'w' => [
-            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b11011, 0b10001,
-        ],
-        'x' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
-        ],
-        'y' => [
-            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
-        ],
-        'z' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
-        ],
-        '0' => [
-            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
-        ],
-        '1' => [
-            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
-        ],
-        '2' => [
-            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
-        ],
-        '3' => [
-            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
-        ],
-        '4' => [
-            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
-        ],
-        '5' => [
-            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
-        ],
-        '6' => [
-            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
-        ],
-        '7' => [
-            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
-        ],
-        '8' => [
-            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
-        ],
-        '9' => [
-            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
-        ],
-        ':' => [
-            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
-        ],
-        '.' => [
-            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
-        ],
-        '-' => [
-            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
-        ],
-        '/' => [
-            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
-        ],
-        ' ' => [0; 7],
-        _ => [
-            0b11111, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
-        ],
-    }
-}
-
-fn logo_vertices(
-    logo_width: u32,
-    logo_height: u32,
-    viewport_width: u32,
-    viewport_height: u32,
-) -> Vec<u8> {
-    let (u0, v0, u1, v1) =
-        if logo_width == 0 || logo_height == 0 || viewport_width == 0 || viewport_height == 0 {
-            (0.0f32, 0.0f32, 1.0f32, 1.0f32)
-        } else {
-            let logo_aspect = logo_width as f32 / logo_height as f32;
-            let viewport_aspect = viewport_width as f32 / viewport_height as f32;
-            if logo_aspect > viewport_aspect {
-                let visible_u = (viewport_aspect / logo_aspect).clamp(0.0, 1.0);
-                let u0 = (1.0 - visible_u) * 0.5;
-                (u0, 0.0, 1.0 - u0, 1.0)
-            } else {
-                let visible_v = (logo_aspect / viewport_aspect).clamp(0.0, 1.0);
-                let v0 = (1.0 - visible_v) * 0.5;
-                (0.0, v0, 1.0, 1.0 - v0)
-            }
-        };
-    let vertices = [
-        (-1.0f32, 1.0f32, u0, v0),
-        (1.0f32, 1.0f32, u1, v0),
-        (1.0f32, -1.0f32, u1, v1),
-        (-1.0f32, 1.0f32, u0, v0),
-        (1.0f32, -1.0f32, u1, v1),
-        (-1.0f32, -1.0f32, u0, v1),
-    ];
-    let mut bytes = Vec::with_capacity(vertices.len() * 20);
-    for (x, y, u, v) in vertices {
-        bytes.extend_from_slice(&x.to_le_bytes());
-        bytes.extend_from_slice(&y.to_le_bytes());
-        bytes.extend_from_slice(&u.to_le_bytes());
-        bytes.extend_from_slice(&v.to_le_bytes());
-        bytes.extend_from_slice(&[255, 255, 255, 255]);
-    }
-    bytes
 }

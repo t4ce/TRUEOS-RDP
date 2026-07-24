@@ -2,60 +2,16 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::api::{Adapter, AdapterConfig};
-use crate::command::{Frame, FrameCommand};
 use crate::renderer::{RenderError, WgpuRenderer};
-
-fn log_render_shape(frame: &Frame) {
-    if frame.seq > 16 && !frame.seq.is_power_of_two() {
-        return;
-    }
-    let mut target = 0u32;
-    let mut screen_rgb = 0u32;
-    let mut screen_tex = 0u32;
-    let mut offscreen_rgb = 0u32;
-    let mut offscreen_tex = 0u32;
-    let mut target_sets = 0u32;
-    for command in &frame.commands {
-        match command {
-            FrameCommand::SetRenderTarget(tex_id) => {
-                target = *tex_id;
-                target_sets = target_sets.saturating_add(1);
-            }
-            FrameCommand::DrawRgb { .. } if target == 0 => {
-                screen_rgb = screen_rgb.saturating_add(1)
-            }
-            FrameCommand::DrawTex { .. } if target == 0 => {
-                screen_tex = screen_tex.saturating_add(1)
-            }
-            FrameCommand::DrawRgb { .. } => offscreen_rgb = offscreen_rgb.saturating_add(1),
-            FrameCommand::DrawTex { .. } => offscreen_tex = offscreen_tex.saturating_add(1),
-            FrameCommand::ClearRgba { .. } => {}
-            _ => {}
-        }
-    }
-    eprintln!(
-        "rdp_viewer [info]: render_shape seq={} cmds={} present={} preserve={} clear=0x{:06x} targets={} final_target={} screen_rgb={} screen_tex={} offscreen_rgb={} offscreen_tex={}",
-        frame.seq,
-        frame.commands.len(),
-        frame.allow_present as u8,
-        frame.preserve_contents as u8,
-        frame.clear_rgb & 0x00ff_ffff,
-        target_sets,
-        target,
-        screen_rgb,
-        screen_tex,
-        offscreen_rgb,
-        offscreen_tex
-    );
-}
 
 pub trait FrameProducer {
     fn cursor_visible(&self) -> bool {
@@ -163,6 +119,7 @@ pub struct WgpuWindowApp<P> {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     last_error: Option<RenderError>,
+    next_redraw: Instant,
 }
 
 pub struct WgpuTwoWindowApp<P, S> {
@@ -368,6 +325,7 @@ impl<P> WgpuWindowApp<P> {
             window: None,
             renderer: None,
             last_error: None,
+            next_redraw: Instant::now(),
         }
     }
 
@@ -854,7 +812,6 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                 if let (Some(renderer), Some(frame)) =
                     (self.renderer.as_mut(), self.adapter.take_last_frame())
                 {
-                    log_render_shape(&frame);
                     if let Err(err) = renderer.render_frame(self.adapter.textures(), &frame) {
                         eprintln!("rdp_viewer [warn]: render_frame failed: {:?}", err);
                         self.last_error = Some(err);
@@ -865,10 +822,15 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         }
     }
 
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        if let Some(window) = &self.window {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_redraw
+            && let Some(window) = &self.window
+        {
             window.request_redraw();
+            self.next_redraw = now + Duration::from_millis(16);
         }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_redraw));
     }
 }
 

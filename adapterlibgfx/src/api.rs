@@ -154,6 +154,16 @@ impl Adapter {
             .upload_rgba(tex_id, width, height, rgba.to_vec())
     }
 
+    pub fn upload_texture_rgba_image_owned(
+        &mut self,
+        tex_id: u32,
+        width: u32,
+        height: u32,
+        rgba: Vec<u8>,
+    ) -> i32 {
+        self.textures.upload_rgba(tex_id, width, height, rgba)
+    }
+
     pub fn texture_status(&self, tex_id: u32) -> i32 {
         self.textures.status(tex_id)
     }

@@ -252,8 +252,30 @@ struct GpuTexture {
     width: u32,
     height: u32,
     revision: u64,
-    _texture: wgpu::Texture,
+    texture: wgpu::Texture,
     view: wgpu::TextureView,
+}
+
+fn upload_texture_pixels(queue: &wgpu::Queue, texture: &wgpu::Texture, image: &TextureImage) {
+    queue.write_texture(
+        wgpu::TexelCopyTextureInfo {
+            texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &image.rgba,
+        wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(image.width * 4),
+            rows_per_image: Some(image.height),
+        },
+        wgpu::Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+    );
 }
 
 pub struct WgpuRenderer {
@@ -679,19 +701,18 @@ impl WgpuRenderer {
 
     fn sync_textures(&mut self, textures: &TextureRegistry) {
         for (&tex_id, image) in textures.iter() {
-            let needs_upload = self
-                .textures
-                .get(&tex_id)
-                .map(|gpu| {
-                    gpu.revision != image.revision
-                        || gpu.width != image.width
-                        || gpu.height != image.height
-                })
-                .unwrap_or(true);
-            if needs_upload {
-                let gpu = self.create_or_upload_texture(tex_id, image);
-                self.textures.insert(tex_id, gpu);
+            if let Some(gpu) = self.textures.get_mut(&tex_id)
+                && gpu.width == image.width
+                && gpu.height == image.height
+            {
+                if gpu.revision != image.revision {
+                    upload_texture_pixels(&self.queue, &gpu.texture, image);
+                    gpu.revision = image.revision;
+                }
+                continue;
             }
+            let gpu = self.create_or_upload_texture(tex_id, image);
+            self.textures.insert(tex_id, gpu);
         }
     }
 
@@ -733,32 +754,14 @@ impl WgpuRenderer {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &image.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.width * 4),
-                rows_per_image: Some(image.height),
-            },
-            wgpu::Extent3d {
-                width: image.width,
-                height: image.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload_texture_pixels(&self.queue, &texture, image);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let _ = tex_id;
         GpuTexture {
             width: image.width,
             height: image.height,
             revision: image.revision,
-            _texture: texture,
+            texture,
             view,
         }
     }
@@ -1422,19 +1425,18 @@ impl WgpuHeadlessRenderer {
 
     fn sync_textures(&mut self, textures: &TextureRegistry) {
         for (&tex_id, image) in textures.iter() {
-            let needs_upload = self
-                .textures
-                .get(&tex_id)
-                .map(|gpu| {
-                    gpu.revision != image.revision
-                        || gpu.width != image.width
-                        || gpu.height != image.height
-                })
-                .unwrap_or(true);
-            if needs_upload {
-                let gpu = self.create_or_upload_texture(tex_id, image);
-                self.textures.insert(tex_id, gpu);
+            if let Some(gpu) = self.textures.get_mut(&tex_id)
+                && gpu.width == image.width
+                && gpu.height == image.height
+            {
+                if gpu.revision != image.revision {
+                    upload_texture_pixels(&self.queue, &gpu.texture, image);
+                    gpu.revision = image.revision;
+                }
+                continue;
             }
+            let gpu = self.create_or_upload_texture(tex_id, image);
+            self.textures.insert(tex_id, gpu);
         }
     }
 
@@ -1455,32 +1457,14 @@ impl WgpuHeadlessRenderer {
                 | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &image.rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(image.width * 4),
-                rows_per_image: Some(image.height),
-            },
-            wgpu::Extent3d {
-                width: image.width,
-                height: image.height,
-                depth_or_array_layers: 1,
-            },
-        );
+        upload_texture_pixels(&self.queue, &texture, image);
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
         let _ = tex_id;
         GpuTexture {
             width: image.width,
             height: image.height,
             revision: image.revision,
-            _texture: texture,
+            texture,
             view,
         }
     }
