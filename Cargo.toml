@@ -6,3 +6,5 @@ publish = false
 
 [dependencies]
 adapterlibgfx = { path = "adapterlibgfx", default-features = false }
+zune-core = { version = "0.5.1", default-features = false }
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["x86"] }

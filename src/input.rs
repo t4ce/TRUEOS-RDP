@@ -2,7 +2,9 @@ use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::target::RemoteTarget;
 
 const HID_UDP_MAGIC: &[u8; 4] = b"THID";
 const HID_UDP_VERSION: u8 = 1;
@@ -146,35 +148,52 @@ fn send_input(
     }
 }
 
-pub fn spawn_sender(target: SocketAddr, input_rx: Receiver<RemoteInput>) {
+pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) {
     thread::spawn(move || {
         let mut sequences = HidUdpSeqs::new();
         let mut sender = None;
+        let mut active_host = String::new();
+        let mut last_attempt = None;
         loop {
-            if sender.is_none() {
-                match HidUdpSender::connect(target) {
-                    Ok(connected) => {
-                        eprintln!(
-                            "trueos-rdp: UDP HID target={} device={}",
-                            target, HID_UDP_DEVICE_ID
-                        );
-                        let probe = RemoteInput::Tablet(TabletInput {
-                            x_q16: 32768,
-                            y_q16: 32768,
-                            buttons_down: 0,
-                            wheel: 0,
-                            flags: INPUT_FLAG_MOTION,
-                        });
-                        if let Err(error) = send_input(&connected, &mut sequences, probe) {
-                            eprintln!("trueos-rdp: UDP HID probe failed: {error}");
+            let current_host = target.host();
+            if current_host != active_host {
+                active_host = current_host;
+                sender = None;
+                last_attempt = None;
+            }
+
+            if sender.is_none()
+                && last_attempt
+                    .is_none_or(|attempt: Instant| attempt.elapsed() >= CONNECT_RETRY_DELAY)
+            {
+                last_attempt = Some(Instant::now());
+                match target.resolve(100) {
+                    Ok(target_addr) => match HidUdpSender::connect(target_addr) {
+                        Ok(connected) => {
+                            eprintln!(
+                                "trueos-rdp: UDP HID target={} device={}",
+                                target_addr, HID_UDP_DEVICE_ID
+                            );
+                            let probe = RemoteInput::Tablet(TabletInput {
+                                x_q16: 32768,
+                                y_q16: 32768,
+                                buttons_down: 0,
+                                wheel: 0,
+                                flags: INPUT_FLAG_MOTION,
+                            });
+                            if let Err(error) = send_input(&connected, &mut sequences, probe) {
+                                eprintln!("trueos-rdp: UDP HID probe failed: {error}");
+                            }
+                            sender = Some(connected);
                         }
-                        sender = Some(connected);
-                    }
-                    Err(error) => {
-                        eprintln!("trueos-rdp: UDP HID unavailable: {error}");
-                        thread::sleep(CONNECT_RETRY_DELAY);
-                        continue;
-                    }
+                        Err(error) => {
+                            eprintln!("trueos-rdp: UDP HID unavailable: {error}");
+                        }
+                    },
+                    Err(error) => eprintln!(
+                        "trueos-rdp: cannot resolve UDP HID target {}: {error}",
+                        active_host
+                    ),
                 }
             }
 

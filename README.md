@@ -3,12 +3,15 @@
 TRUEOS-RDP is a deliberately small remote-display client:
 
 - a normal decorated, resizable OS window;
+- the original wallpaper-backed IP/HOST connection panel and autoconnect flow;
 - one aspect-fitted 1920x1088 video surface with black letterboxing;
+- a local 6 px white pointer with a thin, short fading motion trail;
 - the existing byte-for-byte THID UDP keyboard/tablet sender;
 - the proven TME1 UDP H.264 receiver, feeding a live decoder instead of a file.
 
-The former TCP scene/resource interpreter and its custom startup graphics are
-not part of the viewer anymore.
+The former TCP scene/resource interpreter is not part of the viewer anymore.
+The startup UI now selects the host for the independent TME1 and THID data
+planes; it does not bring back any part of that retired protocol.
 
 ## Run
 
@@ -18,9 +21,14 @@ The host needs `ffmpeg` in `PATH`.
 cargo run --release -- 192.168.178.94
 ```
 
-The default host is `192.168.178.94`, so the address may be omitted. Legacy
-`HOST:100` arguments remain accepted; the client derives the fixed service
-ports from the host.
+Without an argument, the connection panel starts in IP mode with
+`192.168.178.94` and autoconnects in the background. Press Tab or click HOST to
+switch to `trueos.eu`; typing edits the active target and Enter applies it
+immediately. IP mode accepts only digits and dots, while HOST mode accepts DNS
+letters, digits, dots, and hyphens. A command-line host skips changing the
+initial field value but still shows the panel until the first video frame
+arrives. Legacy `HOST:100` arguments remain accepted; the client derives the
+fixed service ports from the host.
 
 Input-only mode is unchanged:
 

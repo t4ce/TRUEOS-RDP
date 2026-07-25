@@ -809,6 +809,9 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             }
             WindowEvent::RedrawRequested => {
                 self.producer.build_frame(&mut self.adapter);
+                if let Some(window) = &self.window {
+                    window.set_cursor_visible(self.producer.cursor_visible());
+                }
                 if let (Some(renderer), Some(frame)) =
                     (self.renderer.as_mut(), self.adapter.take_last_frame())
                 {

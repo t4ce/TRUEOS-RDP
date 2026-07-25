@@ -5,9 +5,12 @@ Run:
 
     ./run.sh 192.168.178.94
 
-Or use the default TRUEOS host:
+Or open the connection panel with the default TRUEOS IP prefilled:
 
     ./run.sh
+
+The panel autoconnects while it is open. Press Tab or click HOST to switch
+between the default IP and trueos.eu.
 
 The executable targets x86_64 Linux with glibc 2.35 or newer. It deliberately
 uses the destination system's Vulkan loader and Intel/other graphics driver;

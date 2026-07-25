@@ -11,8 +11,9 @@ View mode requires ffmpeg. With Homebrew installed:
 The launcher recognizes both Apple Silicon Homebrew (/opt/homebrew/bin) and
 Intel Homebrew (/usr/local/bin).
 
-Double-click TRUEOS-RDP.app to connect to the default TRUEOS host. To select a
-different host from Terminal:
+Double-click TRUEOS-RDP.app to open the autoconnect panel with the default
+TRUEOS IP prefilled. Press Tab or click HOST to switch to trueos.eu. To prefill
+a different host from Terminal:
 
     open TRUEOS-RDP.app --args 192.168.178.94
 

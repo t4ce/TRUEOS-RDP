@@ -15,15 +15,23 @@ The client has three independent paths:
    Resizing and native maximize preserve the 1920x1088 raster by scaling it
    uniformly and clearing unused space to black. The displayed rectangle is
    also used to map pointer coordinates back to the remote normalized input
-   range.
+   range. A local 6 px white cursor and an 80 px maximum, time-faded trail are
+   composed after the video texture so pointer feedback is never dependent on
+   remote-frame latency.
+4. **Startup UI** — until the first decoded video frame arrives, the local
+   wallpaper-backed connection panel edits a shared host target. IP/HOST tab
+   changes retarget the TME1 subscriber and THID sender without changing either
+   wire format. Autoconnect retries continue in the background.
 
 There is no remote scene graph, resource snapshot, remote shader, resize
-recomposition request, custom connection panel, or application-drawn window
-chrome.
+recomposition request, or application-drawn window chrome. The connection
+panel is entirely local and has no relationship to the retired TCP scene
+protocol.
 
 ## Current UDP session latch
 
-The selected IP address makes broadcast discovery unnecessary. The client:
+The selected IP address or hostname makes broadcast discovery unnecessary. The
+client:
 
 1. binds UDP port 9650 once;
 2. unicasts `TME1GET1` every 500 ms until a valid session arrives;
@@ -33,7 +41,9 @@ The selected IP address makes broadcast discovery unnecessary. The client:
    requests the next session.
 
 Keeping the socket alive eliminates the rollover hole created by launching a
-new recording process after each bounded session.
+new recording process after each bounded session. Transient UDP receive errors
+also return to this subscription loop instead of terminating the client media
+worker.
 
 ## Small TCP control plane
 

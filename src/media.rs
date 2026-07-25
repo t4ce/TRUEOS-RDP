@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::target::RemoteTarget;
+
 pub const VIDEO_WIDTH: u32 = 1920;
 pub const VIDEO_HEIGHT: u32 = 1088;
 
@@ -31,22 +33,19 @@ const FLAG_KEYFRAME: u8 = 1 << 2;
 const FLAG_SESSION_END: u8 = 1 << 3;
 const KNOWN_FLAGS: u8 = FLAG_START | FLAG_END | FLAG_KEYFRAME | FLAG_SESSION_END;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct MediaConfig {
     bind: SocketAddr,
-    subscribe_target: SocketAddr,
+    target: RemoteTarget,
 }
 
 impl MediaConfig {
-    pub fn new(subscribe_target: SocketAddr) -> Self {
-        let bind = match subscribe_target {
-            SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9650),
-            SocketAddr::V6(_) => "[::]:9650".parse().expect("valid IPv6 bind"),
+    pub fn new(target: RemoteTarget) -> Self {
+        let bind = match target.host().parse::<IpAddr>() {
+            Ok(IpAddr::V6(_)) => "[::]:9650".parse().expect("valid IPv6 bind"),
+            _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9650),
         };
-        Self {
-            bind,
-            subscribe_target,
-        }
+        Self { bind, target }
     }
 }
 
@@ -68,9 +67,16 @@ struct MediaStatus {
     last_error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct MediaState {
+    pub connected: bool,
+    pub last_error: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct MediaFeed {
     latest_frame: Arc<Mutex<Option<VideoFrame>>>,
+    status: Arc<Mutex<MediaStatus>>,
 }
 
 impl MediaFeed {
@@ -124,23 +130,31 @@ impl MediaFeed {
         thread::spawn(move || decode_frames(stdout, decoder_latest, decoder_status));
         let receiver_status = Arc::clone(&status);
         thread::spawn(move || {
-            let result = receive_media(
-                socket,
-                config.subscribe_target,
-                stdin,
-                receiver_status.clone(),
-            );
+            let result = receive_media(socket, config.target, stdin, receiver_status.clone());
             if let Err(error) = result {
                 set_error(&receiver_status, format!("media receiver stopped: {error}"));
             }
             drop(child);
         });
 
-        Ok(Self { latest_frame })
+        Ok(Self {
+            latest_frame,
+            status,
+        })
     }
 
     pub fn take_latest_frame(&self) -> Option<VideoFrame> {
         self.latest_frame.lock().ok()?.take()
+    }
+
+    pub fn state(&self) -> MediaState {
+        self.status
+            .lock()
+            .map(|status| MediaState {
+                connected: status.connected,
+                last_error: status.last_error.clone(),
+            })
+            .unwrap_or_default()
     }
 }
 
@@ -482,34 +496,77 @@ struct ActiveSession {
 
 fn receive_media(
     socket: UdpSocket,
-    subscribe_target: SocketAddr,
+    target: RemoteTarget,
     mut decoder: ChildStdin,
     status: Arc<Mutex<MediaStatus>>,
 ) -> io::Result<()> {
     eprintln!(
-        "trueos-rdp: media listening={} subscription={}",
+        "trueos-rdp: media listening={} subscription-host={}",
         socket.local_addr()?,
-        subscribe_target
+        target.host()
     );
+    let mut active_host = String::new();
+    let mut subscribe_target = None;
     let mut active: Option<ActiveSession> = None;
     let mut previous_session_id = None;
     let mut last_subscription = None;
+    let mut last_resolve_attempt = None;
     let mut datagram = [0u8; MAX_DATAGRAM_LEN + 1];
 
     loop {
         let now = Instant::now();
+        let current_host = target.host();
+        if current_host != active_host {
+            active_host = current_host;
+            subscribe_target = None;
+            active = None;
+            previous_session_id = None;
+            last_subscription = None;
+            last_resolve_attempt = None;
+            if let Ok(mut current) = status.lock() {
+                current.connected = false;
+                current.last_error = None;
+            }
+        }
+        if subscribe_target.is_none()
+            && last_resolve_attempt
+                .is_none_or(|attempt: Instant| now.duration_since(attempt) >= SUBSCRIBE_INTERVAL)
+        {
+            last_resolve_attempt = Some(now);
+            match target.resolve(9650) {
+                Ok(resolved) => {
+                    eprintln!(
+                        "trueos-rdp: media subscription target={} host={}",
+                        resolved, active_host
+                    );
+                    subscribe_target = Some(resolved);
+                }
+                Err(error) => {
+                    set_error(
+                        &status,
+                        format!("cannot resolve media target {}: {error}", active_host),
+                    );
+                }
+            }
+        }
         if active.is_none()
             && last_subscription
                 .is_none_or(|sent: Instant| now.duration_since(sent) >= SUBSCRIBE_INTERVAL)
+            && let Some(subscription) = subscribe_target
         {
-            let sent = socket.send_to(SUBSCRIBE_TOKEN, subscribe_target)?;
-            if sent != SUBSCRIBE_TOKEN.len() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WriteZero,
-                    "short media subscription",
-                ));
+            match socket.send_to(SUBSCRIBE_TOKEN, subscription) {
+                Ok(sent) if sent == SUBSCRIBE_TOKEN.len() => {
+                    last_subscription = Some(now);
+                }
+                Ok(_) => {
+                    set_error(&status, "short media subscription".to_string());
+                    subscribe_target = None;
+                }
+                Err(error) => {
+                    set_error(&status, format!("media subscription failed: {error}"));
+                    subscribe_target = None;
+                }
             }
-            last_subscription = Some(now);
         }
 
         match socket.recv_from(&mut datagram) {
@@ -529,7 +586,9 @@ fn receive_media(
                 };
 
                 if active.is_none() {
-                    if peer != subscribe_target || previous_session_id == Some(packet.session_id) {
+                    if Some(peer) != subscribe_target
+                        || previous_session_id == Some(packet.session_id)
+                    {
                         continue;
                     }
                     eprintln!(
@@ -576,7 +635,15 @@ fn receive_media(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) => {}
-            Err(error) => return Err(error),
+            Err(error) => {
+                set_error(
+                    &status,
+                    format!("media receive interrupted, retrying: {error}"),
+                );
+                active = None;
+                last_subscription = None;
+                thread::sleep(Duration::from_millis(50));
+            }
         }
 
         let now = Instant::now();
