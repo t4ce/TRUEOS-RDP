@@ -2084,9 +2084,17 @@ fn keyboard_input_event(event: &WindowEvent) -> Option<InputEvent> {
     let WindowEvent::KeyboardInput { event, .. } = event else {
         return None;
     };
-    let hid_keycode = match event.physical_key {
+    let physical_hid = match event.physical_key {
         PhysicalKey::Code(code) => key_code_to_hid(code),
         _ => 0,
+    };
+    // Some window systems report function/print keys only as logical named
+    // keys (or expose an unidentified native scancode). Keep the physical
+    // mapping authoritative, but do not silently drop those named keys.
+    let hid_keycode = if physical_hid != 0 {
+        physical_hid
+    } else {
+        logical_key_to_hid(&event.logical_key)
     };
     if hid_keycode == 0 {
         return None;
@@ -2212,6 +2220,7 @@ fn key_code_to_hid(code: KeyCode) -> u8 {
         KeyCode::F10 => 0x43,
         KeyCode::F11 => 0x44,
         KeyCode::F12 => 0x45,
+        KeyCode::PrintScreen => 0x46,
         KeyCode::Insert => 0x49,
         KeyCode::Home => 0x4A,
         KeyCode::PageUp => 0x4B,
@@ -2234,6 +2243,25 @@ fn key_code_to_hid(code: KeyCode) -> u8 {
     }
 }
 
+fn logical_key_to_hid(key: &Key) -> u8 {
+    match key {
+        Key::Named(NamedKey::F1) => 0x3A,
+        Key::Named(NamedKey::F2) => 0x3B,
+        Key::Named(NamedKey::F3) => 0x3C,
+        Key::Named(NamedKey::F4) => 0x3D,
+        Key::Named(NamedKey::F5) => 0x3E,
+        Key::Named(NamedKey::F6) => 0x3F,
+        Key::Named(NamedKey::F7) => 0x40,
+        Key::Named(NamedKey::F8) => 0x41,
+        Key::Named(NamedKey::F9) => 0x42,
+        Key::Named(NamedKey::F10) => 0x43,
+        Key::Named(NamedKey::F11) => 0x44,
+        Key::Named(NamedKey::F12) => 0x45,
+        Key::Named(NamedKey::PrintScreen) => 0x46,
+        _ => 0,
+    }
+}
+
 fn button_state(state: ElementState) -> InputButtonState {
     match state {
         ElementState::Pressed => InputButtonState::Pressed,
@@ -2249,5 +2277,21 @@ fn mouse_button(button: MouseButton) -> InputMouseButton {
         MouseButton::Back => InputMouseButton::Other(4),
         MouseButton::Forward => InputMouseButton::Other(5),
         MouseButton::Other(value) => InputMouseButton::Other(value),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn printer_shortcuts_keep_boot_hid_usages() {
+        assert_eq!(key_code_to_hid(KeyCode::F10), 0x43);
+        assert_eq!(key_code_to_hid(KeyCode::PrintScreen), 0x46);
+        assert_eq!(logical_key_to_hid(&Key::Named(NamedKey::F10)), 0x43);
+        assert_eq!(
+            logical_key_to_hid(&Key::Named(NamedKey::PrintScreen)),
+            0x46
+        );
     }
 }
