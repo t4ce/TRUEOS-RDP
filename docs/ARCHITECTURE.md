@@ -15,7 +15,7 @@ The client has three independent paths:
    Resizing and native maximize preserve the 1920x1088 raster by scaling it
    uniformly and clearing unused space to black. The displayed rectangle is
    also used to map pointer coordinates back to the remote normalized input
-   range. A local 6 px white cursor and an 80 px maximum, time-faded trail are
+   range. A local 4 px white cursor and an 80 px maximum, time-faded trail are
    composed after the video texture so pointer feedback is never dependent on
    remote-frame latency.
 4. **Startup UI** — until the first decoded video frame arrives, the local

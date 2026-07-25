@@ -5,7 +5,7 @@ TRUEOS-RDP is a deliberately small remote-display client:
 - a normal decorated, resizable OS window;
 - the original wallpaper-backed IP/HOST connection panel and autoconnect flow;
 - one aspect-fitted 1920x1088 video surface with black letterboxing;
-- a local 6 px white pointer with a thin, short fading motion trail;
+- a local 4 px white pointer with a thin, short fading motion trail;
 - the existing byte-for-byte THID UDP keyboard/tablet sender;
 - the proven TME1 UDP H.264 receiver, feeding a live decoder instead of a file.
 
