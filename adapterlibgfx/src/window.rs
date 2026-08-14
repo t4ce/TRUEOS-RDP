@@ -2234,6 +2234,25 @@ fn key_code_to_hid(code: KeyCode) -> u8 {
         KeyCode::ArrowLeft => 0x50,
         KeyCode::ArrowDown => 0x51,
         KeyCode::ArrowUp => 0x52,
+        KeyCode::NumLock => 0x53,
+        KeyCode::NumpadDivide => 0x54,
+        KeyCode::NumpadMultiply => 0x55,
+        KeyCode::NumpadSubtract => 0x56,
+        KeyCode::NumpadAdd => 0x57,
+        KeyCode::NumpadEnter => 0x58,
+        KeyCode::Numpad1 => 0x59,
+        KeyCode::Numpad2 => 0x5A,
+        KeyCode::Numpad3 => 0x5B,
+        KeyCode::Numpad4 => 0x5C,
+        KeyCode::Numpad5 => 0x5D,
+        KeyCode::Numpad6 => 0x5E,
+        KeyCode::Numpad7 => 0x5F,
+        KeyCode::Numpad8 => 0x60,
+        KeyCode::Numpad9 => 0x61,
+        KeyCode::Numpad0 => 0x62,
+        KeyCode::NumpadDecimal => 0x63,
+        KeyCode::NumpadEqual => 0x67,
+        KeyCode::NumpadComma => 0x85,
         KeyCode::ControlLeft => 0xE0,
         KeyCode::ShiftLeft => 0xE1,
         KeyCode::AltLeft => 0xE2,
@@ -2296,5 +2315,18 @@ mod tests {
             logical_key_to_hid(&Key::Named(NamedKey::PrintScreen)),
             0x46
         );
+    }
+
+    #[test]
+    fn numpad_and_super_keys_keep_boot_hid_usages() {
+        assert_eq!(key_code_to_hid(KeyCode::Numpad4), 0x5C);
+        assert_eq!(key_code_to_hid(KeyCode::Numpad5), 0x5D);
+        assert_eq!(key_code_to_hid(KeyCode::Numpad6), 0x5E);
+        assert_eq!(key_code_to_hid(KeyCode::NumpadDivide), 0x54);
+        assert_eq!(key_code_to_hid(KeyCode::NumpadMultiply), 0x55);
+        assert_eq!(key_code_to_hid(KeyCode::NumpadSubtract), 0x56);
+        assert_eq!(key_code_to_hid(KeyCode::NumpadAdd), 0x57);
+        assert_eq!(key_code_to_hid(KeyCode::SuperLeft), 0xE3);
+        assert_eq!(key_code_to_hid(KeyCode::SuperRight), 0xE7);
     }
 }
