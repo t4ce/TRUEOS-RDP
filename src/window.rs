@@ -11,8 +11,13 @@ use winit::window::{Window, WindowAttributes, WindowId};
 
 use crate::api::{Adapter, AdapterConfig};
 use crate::renderer::{RenderError, WgpuRenderer};
+use crate::visual::VisualPresentation;
 
 pub trait FrameProducer {
+    fn visual_presentation(&mut self) -> Option<VisualPresentation> {
+        None
+    }
+
     fn cursor_visible(&self) -> bool {
         true
     }
@@ -823,14 +828,25 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                 }
             }
             WindowEvent::RedrawRequested => {
-                self.producer.build_frame(&mut self.adapter);
-                if let (Some(renderer), Some(frame)) =
-                    (self.renderer.as_mut(), self.adapter.take_last_frame())
-                {
-                    if let Err(err) = renderer.render_frame(self.adapter.textures(), &frame) {
+                if let Some(presentation) = self.producer.visual_presentation() {
+                    if let Some(renderer) = self.renderer.as_mut()
+                        && let Err(err) = renderer.render_visual(presentation)
+                    {
                         eprintln!("adapterlibgfx render error: {err:?}");
                         self.last_error = Some(err);
                     }
+                } else {
+                    self.producer.build_frame(&mut self.adapter);
+                    if let (Some(renderer), Some(frame)) =
+                        (self.renderer.as_mut(), self.adapter.take_last_frame())
+                        && let Err(err) = renderer.render_frame(self.adapter.textures(), &frame)
+                    {
+                        eprintln!("adapterlibgfx render error: {err:?}");
+                        self.last_error = Some(err);
+                    }
+                }
+                if let Some(window) = &self.window {
+                    window.set_cursor_visible(self.producer.cursor_visible());
                 }
             }
             _ => {}
@@ -2089,9 +2105,19 @@ fn handle_window_event<P: FrameProducer>(
             }
         }
         WindowEvent::RedrawRequested => {
-            producer.build_frame(adapter);
-            if let (Some(renderer), Some(frame)) = (renderer.as_mut(), adapter.take_last_frame()) {
-                if let Err(err) = renderer.render_frame(adapter.textures(), &frame) {
+            if let Some(presentation) = producer.visual_presentation() {
+                if let Some(renderer) = renderer.as_mut()
+                    && let Err(err) = renderer.render_visual(presentation)
+                {
+                    eprintln!("adapterlibgfx render error: {err:?}");
+                    *last_error = Some(err);
+                }
+            } else {
+                producer.build_frame(adapter);
+                if let (Some(renderer), Some(frame)) =
+                    (renderer.as_mut(), adapter.take_last_frame())
+                    && let Err(err) = renderer.render_frame(adapter.textures(), &frame)
+                {
                     eprintln!("adapterlibgfx render error: {err:?}");
                     *last_error = Some(err);
                 }

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::process::{ChildStdin, Command, Stdio};
@@ -64,6 +64,10 @@ struct MediaStatus {
     access_units: u64,
     decoded_frames: u64,
     dropped_datagrams: u64,
+    decoded_at: VecDeque<Instant>,
+    datagrams: VecDeque<(Instant, usize)>,
+    arrival_gaps: VecDeque<Duration>,
+    last_datagram_at: Option<Instant>,
     last_error: Option<String>,
 }
 
@@ -71,6 +75,15 @@ struct MediaStatus {
 pub struct MediaState {
     pub connected: bool,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct MediaMetrics {
+    pub frames_per_second: u16,
+    /// Best-effort mean arrival interval for the last 100 accepted datagrams.
+    pub latency_ms: u16,
+    /// Mean wire consumption across at most the last 1000 accepted datagrams.
+    pub bandwidth_kbit: u16,
 }
 
 #[derive(Clone)]
@@ -156,6 +169,76 @@ impl MediaFeed {
             })
             .unwrap_or_default()
     }
+
+    pub fn metrics(&self) -> MediaMetrics {
+        let now = Instant::now();
+        self.status
+            .lock()
+            .map(|status| status.metrics(now))
+            .unwrap_or_default()
+    }
+}
+
+impl MediaStatus {
+    fn reset_metrics(&mut self) {
+        self.decoded_at.clear();
+        self.datagrams.clear();
+        self.arrival_gaps.clear();
+        self.last_datagram_at = None;
+    }
+
+    fn record_datagram(&mut self, at: Instant, bytes: usize) {
+        if let Some(previous) = self.last_datagram_at {
+            self.arrival_gaps.push_back(at.duration_since(previous));
+            if self.arrival_gaps.len() > 100 {
+                self.arrival_gaps.pop_front();
+            }
+        }
+        self.last_datagram_at = Some(at);
+        self.datagrams.push_back((at, bytes));
+        if self.datagrams.len() > 1000 {
+            self.datagrams.pop_front();
+        }
+    }
+
+    fn record_decoded_frame(&mut self, at: Instant) {
+        self.decoded_at.push_back(at);
+        while self.decoded_at.len() > 240 {
+            self.decoded_at.pop_front();
+        }
+    }
+
+    fn metrics(&self, now: Instant) -> MediaMetrics {
+        let frames = self
+            .decoded_at
+            .iter()
+            .filter(|at| now.saturating_duration_since(**at) <= Duration::from_secs(1))
+            .count();
+        let latency_ms = if self.arrival_gaps.is_empty() {
+            0
+        } else {
+            let micros: u128 = self
+                .arrival_gaps
+                .iter()
+                .map(Duration::as_micros)
+                .sum::<u128>()
+                / self.arrival_gaps.len() as u128;
+            ((micros + 500) / 1000).min(9999) as u16
+        };
+        let bandwidth_kbit = match (self.datagrams.front(), self.datagrams.back()) {
+            (Some((first, _)), Some((last, _))) if last > first => {
+                let bytes: u128 = self.datagrams.iter().map(|(_, bytes)| *bytes as u128).sum();
+                let micros = last.duration_since(*first).as_micros().max(1);
+                ((bytes * 8 * 1000) / micros).min(9999) as u16
+            }
+            _ => 0,
+        };
+        MediaMetrics {
+            frames_per_second: frames.min(9999) as u16,
+            latency_ms,
+            bandwidth_kbit,
+        }
+    }
 }
 
 fn decode_frames(
@@ -181,6 +264,7 @@ fn decode_frames(
         }
         if let Ok(mut current) = status.lock() {
             current.decoded_frames = sequence;
+            current.record_decoded_frame(Instant::now());
         }
     }
 }
@@ -606,12 +690,17 @@ fn receive_media(
                         current.connected = true;
                         current.sessions = current.sessions.saturating_add(1);
                         current.last_error = None;
+                        current.reset_metrics();
                     }
                 }
 
                 let session = active.as_mut().unwrap();
                 if peer != session.peer || packet.session_id != session.id {
                     continue;
+                }
+                if let Ok(mut current) = status.lock() {
+                    let wire_overhead = if peer.is_ipv6() { 48 } else { 28 };
+                    current.record_datagram(now, length.saturating_add(wire_overhead));
                 }
                 session.last_packet = now;
                 if let Some(previous) = session.last_datagram_sequence
@@ -776,5 +865,26 @@ mod tests {
             Packet::parse(&bytes),
             Err(PacketError::CrcMismatch)
         ));
+    }
+
+    #[test]
+    fn telemetry_uses_bounded_arrival_and_decode_windows() {
+        let start = Instant::now();
+        let mut status = MediaStatus::default();
+        status.record_datagram(start, 1028);
+        status.record_datagram(start + Duration::from_millis(100), 1028);
+        status.record_decoded_frame(start);
+        status.record_decoded_frame(start + Duration::from_millis(500));
+
+        let metrics = status.metrics(start + Duration::from_secs(1));
+        assert_eq!(metrics.frames_per_second, 2);
+        assert_eq!(metrics.latency_ms, 100);
+        assert_eq!(metrics.bandwidth_kbit, 164);
+
+        status.reset_metrics();
+        assert_eq!(
+            status.metrics(start + Duration::from_secs(1)),
+            MediaMetrics::default()
+        );
     }
 }

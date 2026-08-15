@@ -2,7 +2,7 @@
 
 ## Baseline
 
-The client has three independent paths:
+The client has five independent paths:
 
 1. **Input data plane** — the existing THID packets go to UDP port 100. Their
    magic, version, device ID, sequence handling, keyboard report, tablet
@@ -11,7 +11,10 @@ The client has three independent paths:
    datagrams are CRC-checked and access units are reassembled in bounded
    memory. Complete Annex-B access units feed one long-lived low-latency
    decoder. The newest decoded RGBA frame replaces a persistent GPU texture.
-3. **Presentation** — a decorated winit window draws only that texture.
+3. **Presentation** — after the first decoded frame, the decorated winit window
+   bypasses the local adapter command interpreter. The receiver hands an owned
+   latest image to a dedicated GPU presenter, which updates one retained video
+   texture and composites it, the local pointer, and telemetry in one pass.
    Resizing and native maximize preserve the 2560x1440 raster by scaling it
    uniformly and clearing unused space to black. The displayed rectangle is
    also used to map pointer coordinates back to the remote normalized input
@@ -22,6 +25,13 @@ The client has three independent paths:
    wallpaper-backed connection panel edits a shared host target. IP/HOST tab
    changes retarget the TME1 subscriber and THID sender without changing either
    wire format. Autoconnect retries continue in the background.
+5. **Telemetry** — a disposable 4 Hz worker samples bounded media counters and
+   stamps an opaque 2x `microfont` texture. It cycles headers, four-digit values,
+   and units at the requested cadence. A click in its bottom-right bounds is
+   consumed locally, stops and joins the worker, drops the retained GPU texture,
+   and disables the panel for the remainder of the process. `ping` is a
+   best-effort mean UDP arrival interval: TME1 has no echo or sender timestamp
+   from which a real round-trip time could be calculated.
 
 There is no remote scene graph, resource snapshot, remote shader, resize
 recomposition request, or application-drawn window chrome. The connection

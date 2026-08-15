@@ -1,12 +1,14 @@
 mod input;
 mod media;
 mod target;
+mod telemetry;
 
 mod api;
 mod command;
 mod records;
 mod renderer;
 mod texture;
+mod visual;
 mod window;
 
 use std::env;
@@ -14,7 +16,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::api::{Adapter, AdapterConfig};
-use crate::command::TextureSampleKind;
+use crate::visual::{VisualImage, VisualPresentation};
 use crate::window::{
     FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
 };
@@ -22,13 +24,13 @@ use crate::window::{
 use crate::input::{KeyboardInput, RemoteInput, TabletInput};
 use crate::media::{MediaConfig, MediaFeed, VideoFrame};
 use crate::target::{RemoteTarget, strip_port};
+use crate::telemetry::TelemetryHud;
 
 const DEFAULT_HOST: &str = "192.168.178.94";
 const INPUT_PORT: u16 = 100;
 const MEDIA_PORT: u16 = 9650;
 const INITIAL_WINDOW_WIDTH: u32 = 1280;
 const INITIAL_WINDOW_HEIGHT: u32 = 800;
-const VIDEO_TEXTURE_ID: u32 = 1;
 const LOCAL_CURSOR_RADIUS: f32 = 4.0;
 const LOCAL_CURSOR_OUTLINE_RADIUS: f32 = 5.25;
 const CURSOR_TRAIL_MAX_LENGTH: f32 = 80.0;
@@ -69,6 +71,9 @@ struct Viewer {
     decoded_frames: u64,
     startup_host_mode: bool,
     startup_started: Instant,
+    telemetry: Option<TelemetryHud>,
+    telemetry_disabled: bool,
+    suppress_telemetry_release: bool,
 }
 
 impl Viewer {
@@ -100,6 +105,9 @@ impl Viewer {
             decoded_frames: 0,
             startup_host_mode,
             startup_started: Instant::now(),
+            telemetry: None,
+            telemetry_disabled: false,
+            suppress_telemetry_release: false,
         }
     }
 
@@ -179,26 +187,33 @@ impl Viewer {
         self.emit_keyboard();
     }
 
-    fn upload_latest_frame(&mut self, adapter: &mut Adapter) {
-        let Some(frame) = self.take_latest_video_frame() else {
-            return;
-        };
+    fn accept_video_frame(&mut self, frame: &VideoFrame) {
         self.source_width = frame.width;
         self.source_height = frame.height;
         self.decoded_frames = frame.sequence;
         let first_video_frame = !self.have_video;
-        if adapter.upload_texture_rgba_image(
-            VIDEO_TEXTURE_ID,
-            frame.width,
-            frame.height,
-            &frame.rgba,
-        ) == 0
-        {
-            self.have_video = true;
-            if first_video_frame {
-                self.cursor_trail.clear();
+        self.have_video = true;
+        if first_video_frame {
+            self.cursor_trail.clear();
+            if !self.telemetry_disabled
+                && let Some(media) = self.media.clone()
+            {
+                self.telemetry = TelemetryHud::spawn(media);
             }
         }
+    }
+
+    fn telemetry_hit(&self) -> bool {
+        self.telemetry.is_some()
+            && self.cursor_x >= self.window_width.saturating_sub(telemetry::WIDTH) as f32
+            && self.cursor_y >= self.window_height.saturating_sub(telemetry::HEIGHT) as f32
+    }
+
+    fn disable_telemetry(&mut self) {
+        if let Some(mut telemetry) = self.telemetry.take() {
+            telemetry.disable();
+        }
+        self.telemetry_disabled = true;
     }
 
     fn update_cursor_position(&mut self, x: f32, y: f32, leave_trail: bool) {
@@ -276,6 +291,56 @@ impl Viewer {
 }
 
 impl FrameProducer for Viewer {
+    fn visual_presentation(&mut self) -> Option<VisualPresentation> {
+        if self.no_view {
+            return None;
+        }
+        let image = self.take_latest_video_frame().map(|frame| {
+            self.accept_video_frame(&frame);
+            VisualImage {
+                width: frame.width,
+                height: frame.height,
+                rgba: frame.rgba,
+            }
+        });
+        if !self.have_video {
+            return None;
+        }
+        let rect = aspect_fit_rect(
+            self.window_width,
+            self.window_height,
+            self.source_width,
+            self.source_height,
+        );
+        let width = self.window_width.max(1) as f32;
+        let height = self.window_height.max(1) as f32;
+        Some(VisualPresentation {
+            image,
+            video_bounds: [
+                rect.x / width * 2.0 - 1.0,
+                1.0 - rect.y / height * 2.0,
+                (rect.x + rect.width) / width * 2.0 - 1.0,
+                1.0 - (rect.y + rect.height) / height * 2.0,
+            ],
+            overlay_vertices: local_cursor_vertices(
+                self.window_width,
+                self.window_height,
+                self.cursor_x,
+                self.cursor_y,
+                &self.cursor_trail,
+                Instant::now(),
+            ),
+            telemetry: self.telemetry.as_ref().and_then(TelemetryHud::take_latest),
+            telemetry_visible: self.telemetry.is_some(),
+            telemetry_bounds: [
+                1.0 - telemetry::WIDTH as f32 / width * 2.0,
+                -1.0 + telemetry::HEIGHT as f32 / height * 2.0,
+                1.0,
+                -1.0,
+            ],
+        })
+    }
+
     fn cursor_visible(&self) -> bool {
         self.no_view || !self.have_video
     }
@@ -323,9 +388,7 @@ impl FrameProducer for Viewer {
                     }
                 }
                 InputEvent::KeyboardInput {
-                    hid_keycode,
-                    state,
-                    ..
+                    hid_keycode, state, ..
                 } => {
                     if hid_keycode == 0x2B && state == InputButtonState::Pressed {
                         self.toggle_startup_mode();
@@ -355,6 +418,17 @@ impl FrameProducer for Viewer {
                 self.emit_tablet(input::INPUT_FLAG_MOTION, 0);
             }
             InputEvent::MouseButton { button, state } => {
+                if button == InputMouseButton::Left {
+                    if state == InputButtonState::Pressed && self.telemetry_hit() {
+                        self.disable_telemetry();
+                        self.suppress_telemetry_release = true;
+                        return;
+                    }
+                    if state == InputButtonState::Released && self.suppress_telemetry_release {
+                        self.suppress_telemetry_release = false;
+                        return;
+                    }
+                }
                 let bit = mouse_button_bit(button);
                 match state {
                     InputButtonState::Pressed => self.buttons_down |= bit,
@@ -370,9 +444,7 @@ impl FrameProducer for Viewer {
                 }
             }
             InputEvent::KeyboardInput {
-                hid_keycode,
-                state,
-                ..
+                hid_keycode, state, ..
             } => {
                 self.update_keyboard(hid_keycode, state);
             }
@@ -381,34 +453,8 @@ impl FrameProducer for Viewer {
     }
 
     fn build_frame(&mut self, adapter: &mut Adapter) {
-        if !self.no_view {
-            self.upload_latest_frame(adapter);
-        }
-
         let _ = adapter.begin_frame(0x000000);
-        if !self.no_view && self.have_video {
-            let vertices = aspect_fit_vertices(
-                self.window_width,
-                self.window_height,
-                self.source_width,
-                self.source_height,
-            );
-            let _ = adapter.set_sampler_raw(0, 0, 1, 1);
-            let _ = adapter.draw_sprite_batch_sample_kind_no_present(
-                VIDEO_TEXTURE_ID,
-                TextureSampleKind::Rgba,
-                &vertices,
-            );
-            draw_local_cursor(
-                adapter,
-                self.window_width,
-                self.window_height,
-                self.cursor_x,
-                self.cursor_y,
-                &self.cursor_trail,
-                Instant::now(),
-            );
-        } else if !self.no_view {
+        if !self.no_view {
             self.draw_startup(adapter);
         }
         let _ = adapter.end_frame();
@@ -442,39 +488,6 @@ fn aspect_fit_rect(
         width,
         height,
     }
-}
-
-fn aspect_fit_vertices(
-    window_width: u32,
-    window_height: u32,
-    source_width: u32,
-    source_height: u32,
-) -> Vec<u8> {
-    let rect = aspect_fit_rect(window_width, window_height, source_width, source_height);
-    let window_width = window_width.max(1) as f32;
-    let window_height = window_height.max(1) as f32;
-    let x0 = rect.x / window_width * 2.0 - 1.0;
-    let x1 = (rect.x + rect.width) / window_width * 2.0 - 1.0;
-    let y0 = 1.0 - rect.y / window_height * 2.0;
-    let y1 = 1.0 - (rect.y + rect.height) / window_height * 2.0;
-    let vertices = [
-        (x0, y0, 0.0f32, 0.0f32),
-        (x1, y0, 1.0, 0.0),
-        (x1, y1, 1.0, 1.0),
-        (x0, y0, 0.0, 0.0),
-        (x1, y1, 1.0, 1.0),
-        (x0, y1, 0.0, 1.0),
-    ];
-
-    let mut bytes = Vec::with_capacity(vertices.len() * 20);
-    for (x, y, u, v) in vertices {
-        bytes.extend_from_slice(&x.to_le_bytes());
-        bytes.extend_from_slice(&y.to_le_bytes());
-        bytes.extend_from_slice(&u.to_le_bytes());
-        bytes.extend_from_slice(&v.to_le_bytes());
-        bytes.extend_from_slice(&[255, 255, 255, 255]);
-    }
-    bytes
 }
 
 fn point_distance(x0: f32, y0: f32, x1: f32, y1: f32) -> f32 {
@@ -612,15 +625,14 @@ fn push_circle(
     }
 }
 
-fn draw_local_cursor(
-    adapter: &mut Adapter,
+fn local_cursor_vertices(
     width: u32,
     height: u32,
     cursor_x: f32,
     cursor_y: f32,
     samples: &[CursorSample],
     now: Instant,
-) {
+) -> Vec<u8> {
     let width = width.max(1) as f32;
     let height = height.max(1) as f32;
     let trail = clipped_cursor_trail(samples, now, CURSOR_TRAIL_MAX_LENGTH);
@@ -685,9 +697,7 @@ fn draw_local_cursor(
         0xffffff,
         255,
     );
-    let _ = adapter.set_blend_raw(1, 0x0302, 0x0303);
-    let _ = adapter.draw_solid_batch_no_present(&bytes);
-    let _ = adapter.set_blend_raw(0, 1, 0);
+    bytes
 }
 
 fn draw_startup_panel(

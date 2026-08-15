@@ -12,6 +12,7 @@ use crate::command::{
 };
 use crate::records::{Rgba8, SolidTriangle, SpriteTriangle};
 use crate::texture::{TextureImage, TextureRegistry};
+use crate::visual::{VisualPresentation, VisualPresenter};
 
 #[derive(Debug)]
 pub enum RenderError {
@@ -130,6 +131,7 @@ pub struct WgpuRenderer {
     config: wgpu::SurfaceConfiguration,
     surfaces: HashMap<u32, CpuSurface>,
     upload_scratch: Vec<u8>,
+    visual_presenter: VisualPresenter,
 }
 
 pub struct WgpuHeadlessRenderer {
@@ -228,6 +230,7 @@ impl WgpuRenderer {
             config.width,
             config.height
         );
+        let visual_presenter = VisualPresenter::new(&device, config.format);
         Ok(Self {
             window,
             surface,
@@ -236,6 +239,7 @@ impl WgpuRenderer {
             config,
             surfaces: HashMap::new(),
             upload_scratch: Vec::new(),
+            visual_presenter,
         })
     }
 
@@ -318,6 +322,58 @@ impl WgpuRenderer {
         self.queue.submit(std::iter::empty());
         self.queue.present(surface_frame);
         Ok(())
+    }
+
+    pub fn render_visual(&mut self, presentation: VisualPresentation) -> Result<(), RenderError> {
+        let surface_frame = match self.acquire_surface()? {
+            Some(frame) => frame,
+            None => return Ok(()),
+        };
+        let view = surface_frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        if let Some(commands) =
+            self.visual_presenter
+                .encode(&self.device, &self.queue, &view, presentation)
+        {
+            self.queue.submit([commands]);
+            self.queue.present(surface_frame);
+        }
+        Ok(())
+    }
+
+    fn acquire_surface(&mut self) -> Result<Option<wgpu::SurfaceTexture>, RenderError> {
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.resize(self.window.inner_size());
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+                    wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+                    wgpu::CurrentSurfaceTexture::Outdated => {
+                        return Err(RenderError::Surface("surface still outdated".into()));
+                    }
+                    wgpu::CurrentSurfaceTexture::Lost => {
+                        return Err(RenderError::Surface("surface lost".into()));
+                    }
+                    wgpu::CurrentSurfaceTexture::Timeout
+                    | wgpu::CurrentSurfaceTexture::Occluded => {
+                        return Ok(None);
+                    }
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        return Err(RenderError::Surface("validation error".into()));
+                    }
+                }
+            }
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(None);
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::Surface("validation error".into()));
+            }
+        };
+        Ok(Some(frame))
     }
 }
 
