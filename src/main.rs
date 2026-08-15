@@ -2,19 +2,22 @@ mod input;
 mod media;
 mod target;
 
+mod api;
+mod command;
+mod records;
+mod renderer;
+mod texture;
+mod window;
+
 use std::env;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use adapterlibgfx::api::{Adapter, AdapterConfig};
-use adapterlibgfx::command::TextureSampleKind;
-use adapterlibgfx::window::{
+use crate::api::{Adapter, AdapterConfig};
+use crate::command::TextureSampleKind;
+use crate::window::{
     FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
 };
-use zune_core::bytestream::ZCursor;
-use zune_core::colorspace::ColorSpace;
-use zune_core::options::DecoderOptions;
-use zune_jpeg::JpegDecoder;
 
 use crate::input::{KeyboardInput, RemoteInput, TabletInput};
 use crate::media::{MediaConfig, MediaFeed, VideoFrame};
@@ -26,8 +29,6 @@ const MEDIA_PORT: u16 = 9650;
 const INITIAL_WINDOW_WIDTH: u32 = 1280;
 const INITIAL_WINDOW_HEIGHT: u32 = 800;
 const VIDEO_TEXTURE_ID: u32 = 1;
-const LOGO_TEXTURE_ID: u32 = u32::MAX - 1;
-const LOGO_JPEG: &[u8] = include_bytes!("../logo.jpg");
 const LOCAL_CURSOR_RADIUS: f32 = 4.0;
 const LOCAL_CURSOR_OUTLINE_RADIUS: f32 = 5.25;
 const CURSOR_TRAIL_MAX_LENGTH: f32 = 80.0;
@@ -67,9 +68,6 @@ struct Viewer {
     keyboard_keys: [u8; 6],
     decoded_frames: u64,
     startup_host_mode: bool,
-    logo_texture_ready: bool,
-    logo_width: u32,
-    logo_height: u32,
     startup_started: Instant,
 }
 
@@ -101,9 +99,6 @@ impl Viewer {
             keyboard_keys: [0; 6],
             decoded_frames: 0,
             startup_host_mode,
-            logo_texture_ready: false,
-            logo_width: 0,
-            logo_height: 0,
             startup_started: Instant::now(),
         }
     }
@@ -192,11 +187,11 @@ impl Viewer {
         self.source_height = frame.height;
         self.decoded_frames = frame.sequence;
         let first_video_frame = !self.have_video;
-        if adapter.upload_texture_rgba_image_owned(
+        if adapter.upload_texture_rgba_image(
             VIDEO_TEXTURE_ID,
             frame.width,
             frame.height,
-            frame.rgba,
+            &frame.rgba,
         ) == 0
         {
             self.have_video = true;
@@ -257,41 +252,7 @@ impl Viewer {
         self.set_startup_mode(!self.startup_host_mode);
     }
 
-    fn ensure_logo_texture(&mut self, adapter: &mut Adapter) {
-        if self.logo_texture_ready {
-            return;
-        }
-        match decode_jpeg_rgba(LOGO_JPEG) {
-            Ok((width, height, rgba)) => {
-                if adapter.upload_texture_rgba_image_owned(LOGO_TEXTURE_ID, width, height, rgba)
-                    == 0
-                {
-                    self.logo_width = width;
-                    self.logo_height = height;
-                }
-            }
-            Err(error) => eprintln!("trueos-rdp: wallpaper decode failed: {error}"),
-        }
-        self.logo_texture_ready = true;
-    }
-
     fn draw_startup(&mut self, adapter: &mut Adapter) {
-        self.ensure_logo_texture(adapter);
-        if self.logo_width != 0 && self.logo_height != 0 {
-            let vertices = cover_vertices(
-                self.logo_width,
-                self.logo_height,
-                self.window_width,
-                self.window_height,
-            );
-            let _ = adapter.set_sampler_raw(0, 0, 1, 1);
-            let _ = adapter.draw_tex_triangles_sample_kind_no_present(
-                LOGO_TEXTURE_ID,
-                TextureSampleKind::Rgba,
-                &vertices,
-            );
-        }
-
         let state = self
             .media
             .as_ref()
@@ -353,13 +314,21 @@ impl FrameProducer for Viewer {
                     self.update_startup_target();
                 }
                 InputEvent::EnterPressed => self.update_startup_target(),
-                InputEvent::KeyPressed(InputKey::Tab) => self.toggle_startup_mode(),
                 InputEvent::KeyPressed(key) => {
                     if let Some(ch) = startup_key_char(key)
                         && target_char_allowed(self.startup_host_mode, ch)
                     {
                         self.target_text.push(ch);
                         self.update_startup_target();
+                    }
+                }
+                InputEvent::KeyboardInput {
+                    hid_keycode,
+                    state,
+                    ..
+                } => {
+                    if hid_keycode == 0x2B && state == InputButtonState::Pressed {
+                        self.toggle_startup_mode();
                     }
                 }
                 InputEvent::MouseButton {
@@ -400,7 +369,11 @@ impl FrameProducer for Viewer {
                     self.emit_tablet(input::INPUT_FLAG_WHEEL, wheel);
                 }
             }
-            InputEvent::KeyboardInput { hid_keycode, state } => {
+            InputEvent::KeyboardInput {
+                hid_keycode,
+                state,
+                ..
+            } => {
                 self.update_keyboard(hid_keycode, state);
             }
             _ => {}
@@ -421,7 +394,7 @@ impl FrameProducer for Viewer {
                 self.source_height,
             );
             let _ = adapter.set_sampler_raw(0, 0, 1, 1);
-            let _ = adapter.draw_tex_triangles_sample_kind_no_present(
+            let _ = adapter.draw_sprite_batch_sample_kind_no_present(
                 VIDEO_TEXTURE_ID,
                 TextureSampleKind::Rgba,
                 &vertices,
@@ -493,74 +466,6 @@ fn aspect_fit_vertices(
         (x0, y1, 0.0, 1.0),
     ];
 
-    let mut bytes = Vec::with_capacity(vertices.len() * 20);
-    for (x, y, u, v) in vertices {
-        bytes.extend_from_slice(&x.to_le_bytes());
-        bytes.extend_from_slice(&y.to_le_bytes());
-        bytes.extend_from_slice(&u.to_le_bytes());
-        bytes.extend_from_slice(&v.to_le_bytes());
-        bytes.extend_from_slice(&[255, 255, 255, 255]);
-    }
-    bytes
-}
-
-fn decode_jpeg_rgba(bytes: &[u8]) -> Result<(u32, u32, Vec<u8>), String> {
-    let options = DecoderOptions::default()
-        .jpeg_set_out_colorspace(ColorSpace::RGBA)
-        .set_use_unsafe(true);
-    let mut decoder = JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    decoder
-        .decode_headers()
-        .map_err(|error| error.to_string())?;
-    let info = decoder
-        .info()
-        .ok_or_else(|| "jpeg missing image info".to_string())?;
-    let width = u32::from(info.width);
-    let height = u32::from(info.height);
-    if width == 0 || height == 0 {
-        return Err("jpeg has zero-sized image".to_string());
-    }
-    let rgba = decoder.decode().map_err(|error| error.to_string())?;
-    let expected = width as usize * height as usize * 4;
-    if rgba.len() != expected {
-        return Err(format!(
-            "jpeg decoded size mismatch got {}, expected {expected}",
-            rgba.len()
-        ));
-    }
-    Ok((width, height, rgba))
-}
-
-fn cover_vertices(
-    image_width: u32,
-    image_height: u32,
-    viewport_width: u32,
-    viewport_height: u32,
-) -> Vec<u8> {
-    let (u0, v0, u1, v1) =
-        if image_width == 0 || image_height == 0 || viewport_width == 0 || viewport_height == 0 {
-            (0.0f32, 0.0f32, 1.0f32, 1.0f32)
-        } else {
-            let image_aspect = image_width as f32 / image_height as f32;
-            let viewport_aspect = viewport_width as f32 / viewport_height as f32;
-            if image_aspect > viewport_aspect {
-                let visible_u = (viewport_aspect / image_aspect).clamp(0.0, 1.0);
-                let u0 = (1.0 - visible_u) * 0.5;
-                (u0, 0.0, 1.0 - u0, 1.0)
-            } else {
-                let visible_v = (image_aspect / viewport_aspect).clamp(0.0, 1.0);
-                let v0 = (1.0 - visible_v) * 0.5;
-                (0.0, v0, 1.0, 1.0 - v0)
-            }
-        };
-    let vertices = [
-        (-1.0f32, 1.0f32, u0, v0),
-        (1.0f32, 1.0f32, u1, v0),
-        (1.0f32, -1.0f32, u1, v1),
-        (-1.0f32, 1.0f32, u0, v0),
-        (1.0f32, -1.0f32, u1, v1),
-        (-1.0f32, -1.0f32, u0, v1),
-    ];
     let mut bytes = Vec::with_capacity(vertices.len() * 20);
     for (x, y, u, v) in vertices {
         bytes.extend_from_slice(&x.to_le_bytes());
@@ -781,7 +686,7 @@ fn draw_local_cursor(
         255,
     );
     let _ = adapter.set_blend_raw(1, 0x0302, 0x0303);
-    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+    let _ = adapter.draw_solid_batch_no_present(&bytes);
     let _ = adapter.set_blend_raw(0, 1, 0);
 }
 
@@ -984,7 +889,7 @@ fn draw_startup_panel(
     );
 
     let _ = adapter.set_blend_raw(1, 0x0302, 0x0303);
-    let _ = adapter.draw_rgb_triangles_no_present(&bytes);
+    let _ = adapter.draw_solid_batch_no_present(&bytes);
     let _ = adapter.set_blend_raw(0, 1, 0);
 }
 
@@ -1032,7 +937,6 @@ fn startup_key_char(key: InputKey) -> Option<char> {
         InputKey::J => Some('j'),
         InputKey::H => Some('h'),
         InputKey::K => Some('k'),
-        InputKey::Tab => None,
     }
 }
 
