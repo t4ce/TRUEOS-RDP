@@ -43,9 +43,9 @@ rustup target add "${ARM_TARGET}" "${INTEL_TARGET}"
 (
     cd "${REPO_DIR}"
     MACOSX_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" \
-        cargo build --locked --release --target "${ARM_TARGET}"
+    cargo build --release --target "${ARM_TARGET}"
     MACOSX_DEPLOYMENT_TARGET="${DEPLOYMENT_TARGET}" \
-        cargo build --locked --release --target "${INTEL_TARGET}"
+        cargo build --release --target "${INTEL_TARGET}"
 )
 
 install -d "${DIST_DIR}"

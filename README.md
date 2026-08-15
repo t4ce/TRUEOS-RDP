@@ -102,6 +102,23 @@ different address:
 open dist/TRUEOS-RDP.app --args 192.168.178.94
 ```
 
+## Package all supported targets
+
+Build the available platform packages from one command:
+
+```sh
+./tools/package-all-targets.sh
+```
+
+The script runs all feasible host-native packages and reports unavailable ones.
+You can also scope it:
+
+```sh
+./tools/package-all-targets.sh --linux
+./tools/package-all-targets.sh --macos
+./tools/package-all-targets.sh --windows
+```
+
 ## Ports
 
 | Port | Transport | Direction | Purpose |

@@ -59,7 +59,7 @@ fi
     cd "${REPO_DIR}"
     PATH="${CARGO_ZIGBUILD_DIR}/bin:${PATH}" \
     CARGO_ZIGBUILD_ZIG_PATH="${ZIG_DIR}/zig" \
-        cargo zigbuild --locked --release --target "${BUILD_TARGET}"
+    cargo zigbuild --release --target "${BUILD_TARGET}"
 )
 
 if [[ ! -x "${RELEASE_BINARY}" ]]; then
