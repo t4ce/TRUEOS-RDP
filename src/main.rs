@@ -1352,18 +1352,18 @@ mod tests {
 
     #[test]
     fn letterboxes_wide_source_in_tall_window() {
-        let rect = aspect_fit_rect(800, 800, 1920, 1088);
+        let rect = aspect_fit_rect(800, 800, 2560, 1440);
         assert_eq!(rect.x, 0.0);
-        assert!(rect.y > 170.0);
+        assert_eq!(rect.y, 175.0);
         assert_eq!(rect.width, 800.0);
-        assert!(rect.height > 453.0 && rect.height < 454.0);
+        assert_eq!(rect.height, 450.0);
     }
 
     #[test]
     fn pillarboxes_wide_window() {
-        let rect = aspect_fit_rect(2560, 1088, 1920, 1088);
+        let rect = aspect_fit_rect(2560, 1080, 2560, 1440);
         assert_eq!(rect.y, 0.0);
-        assert_eq!(rect.height, 1088.0);
+        assert_eq!(rect.height, 1080.0);
         assert_eq!(rect.width, 1920.0);
         assert_eq!(rect.x, 320.0);
     }

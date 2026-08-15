@@ -12,7 +12,7 @@ The client has three independent paths:
    memory. Complete Annex-B access units feed one long-lived low-latency
    decoder. The newest decoded RGBA frame replaces a persistent GPU texture.
 3. **Presentation** — a decorated winit window draws only that texture.
-   Resizing and native maximize preserve the 1920x1088 raster by scaling it
+   Resizing and native maximize preserve the 2560x1440 raster by scaling it
    uniformly and clearing unused space to black. The displayed rectangle is
    also used to map pointer coordinates back to the remote normalized input
    range. A local 4 px white cursor and an 80 px maximum, time-faded trail are

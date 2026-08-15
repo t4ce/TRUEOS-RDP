@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use crate::target::RemoteTarget;
 
-pub const VIDEO_WIDTH: u32 = 1920;
-pub const VIDEO_HEIGHT: u32 = 1088;
+pub const VIDEO_WIDTH: u32 = 2560;
+pub const VIDEO_HEIGHT: u32 = 1440;
 
 const VIDEO_RGBA_BYTES: usize = VIDEO_WIDTH as usize * VIDEO_HEIGHT as usize * 4;
 const MAGIC: [u8; 4] = *b"TME1";
