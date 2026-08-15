@@ -805,6 +805,9 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         if let Some(input) = input_event(&event) {
             self.producer.handle_input(input);
         }
+        if let Some(input) = keyboard_input_event(&event) {
+            self.producer.handle_input(input);
+        }
 
         match event {
             WindowEvent::CloseRequested => {
