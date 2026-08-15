@@ -10,7 +10,7 @@ use crate::command::{
     BlendFactor, BlendState, Frame, FrameCommand, SamplerFilter, SamplerState, ScissorRect,
     TextureEffect, TextureSampleKind,
 };
-use crate::records::{Rgba8, SolidRect, SpriteQuad};
+use crate::records::{Rgba8, SolidTriangle, SpriteTriangle};
 use crate::texture::{TextureImage, TextureRegistry};
 
 #[derive(Debug)]
@@ -162,15 +162,13 @@ impl WgpuRenderer {
             Err(_) => return Err(RenderError::AdapterUnavailable),
         };
         let info = adapter.get_info();
-        let (device, queue) = match block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("adapterlibgfx-copy-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                ..Default::default()
-            },
-        )) {
+        let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("adapterlibgfx-copy-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        })) {
             Ok((device, queue)) => (device, queue),
             Err(error) => return Err(RenderError::DeviceUnavailable(error.to_string())),
         };
@@ -277,26 +275,27 @@ impl WgpuRenderer {
                     wgpu::CurrentSurfaceTexture::Success(texture) => texture,
                     wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
                     wgpu::CurrentSurfaceTexture::Outdated => {
-                        return Err(RenderError::Surface("surface still outdated".into()))
+                        return Err(RenderError::Surface("surface still outdated".into()));
                     }
                     wgpu::CurrentSurfaceTexture::Lost => {
-                        return Err(RenderError::Surface("surface lost".into()))
+                        return Err(RenderError::Surface("surface lost".into()));
                     }
                     wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
                     wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
                     wgpu::CurrentSurfaceTexture::Validation => {
-                        return Err(RenderError::Surface("validation error".into()))
+                        return Err(RenderError::Surface("validation error".into()));
                     }
                 }
             }
             wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
             wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
             wgpu::CurrentSurfaceTexture::Validation => {
-                return Err(RenderError::Surface("validation error".into()))
+                return Err(RenderError::Surface("validation error".into()));
             }
         };
         let present = scale_surface(&logical, self.config.width, self.config.height);
-        let upload = surface_upload_bytes(&present, self.config.format, &mut self.upload_scratch);
+        let (upload, bytes_per_row) =
+            surface_upload_bytes(&present, self.config.format, &mut self.upload_scratch);
         self.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &surface_frame.texture,
@@ -307,7 +306,7 @@ impl WgpuRenderer {
             upload.as_ref(),
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: Some(present.width * 4),
+                bytes_per_row: Some(bytes_per_row),
                 rows_per_image: Some(present.height),
             },
             wgpu::Extent3d {
@@ -348,18 +347,50 @@ fn surface_upload_bytes<'a>(
     surface: &'a CpuSurface,
     format: wgpu::TextureFormat,
     scratch: &'a mut Vec<u8>,
-) -> Cow<'a, [u8]> {
-    match format {
-        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb => {
-            scratch.clear();
-            scratch.extend_from_slice(&surface.rgba);
-            for px in scratch.chunks_exact_mut(4) {
-                px.swap(0, 2);
-            }
-            Cow::Borrowed(scratch.as_slice())
-        }
-        _ => Cow::Borrowed(&surface.rgba),
+) -> (Cow<'a, [u8]>, u32) {
+    let stride_bytes = surface.width * 4;
+    let aligned_stride = align_to(stride_bytes, wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let needs_padding = aligned_stride != stride_bytes;
+    let needs_bgra_swap = matches!(
+        format,
+        wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Bgra8UnormSrgb
+    );
+
+    if !needs_padding && !needs_bgra_swap {
+        return (Cow::Borrowed(&surface.rgba), stride_bytes);
     }
+
+    scratch.clear();
+    scratch.resize(
+        (aligned_stride as usize).saturating_mul(surface.height as usize),
+        0,
+    );
+    for row in 0..surface.height {
+        let src_start = (row * stride_bytes) as usize;
+        let src_end = src_start + stride_bytes as usize;
+        let dst_start = (row * aligned_stride) as usize;
+        let dst_row = &mut scratch[dst_start..dst_start + stride_bytes as usize];
+        let src_row = &surface.rgba[src_start..src_end];
+        if needs_bgra_swap {
+            for (src, dst) in src_row.chunks_exact(4).zip(dst_row.chunks_exact_mut(4)) {
+                dst[0] = src[2];
+                dst[1] = src[1];
+                dst[2] = src[0];
+                dst[3] = src[3];
+            }
+        } else {
+            dst_row.copy_from_slice(src_row);
+        }
+    }
+
+    (Cow::Borrowed(scratch), aligned_stride)
+}
+
+fn align_to(value: u32, alignment: u32) -> u32 {
+    if alignment == 0 {
+        return value;
+    }
+    value.saturating_add(alignment - 1) / alignment * alignment
 }
 
 impl WgpuHeadlessRenderer {
@@ -375,15 +406,13 @@ impl WgpuHeadlessRenderer {
             "adapterlibgfx headless selected: backend={:?} vendor=0x{:04X} device=0x{:04X} name={}",
             info.backend, info.vendor, info.device, info.name
         );
-        let (device, queue) = match block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("adapterlibgfx-headless-copy-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits::default(),
-                memory_hints: wgpu::MemoryHints::Performance,
-                ..Default::default()
-            },
-        )) {
+        let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("adapterlibgfx-headless-copy-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: wgpu::Limits::default(),
+            memory_hints: wgpu::MemoryHints::Performance,
+            ..Default::default()
+        })) {
             Ok((device, queue)) => (device, queue),
             Err(error) => return Err(RenderError::DeviceUnavailable(error.to_string())),
         };
@@ -459,20 +488,20 @@ fn paint_frame(
                 };
                 ensure_target_surface(surfaces, textures, *tex_id, target_width, target_height)?;
             }
-            FrameCommand::DrawSolid { rects } => {
+            FrameCommand::DrawSolid { triangles } => {
                 ensure_target_surface_for_state(surfaces, textures, state.target, width, height)?;
                 clear_target_once(surfaces, state.target, &mut cleared, frame);
                 let target = surfaces
                     .get_mut(&state.target)
                     .ok_or(RenderError::InvalidTarget(state.target))?;
-                for rect in rects {
-                    paint_solid_rect(target, *rect, state);
+                for triangle in triangles {
+                    paint_solid_triangle(target, *triangle, state);
                 }
             }
             FrameCommand::DrawSprite {
                 tex_id,
                 sample_kind,
-                quads,
+                triangles,
             } => {
                 ensure_target_surface_for_state(surfaces, textures, state.target, width, height)?;
                 clear_target_once(surfaces, state.target, &mut cleared, frame);
@@ -488,8 +517,8 @@ fn paint_frame(
                 let target = surfaces
                     .get_mut(&state.target)
                     .ok_or(RenderError::InvalidTarget(state.target))?;
-                for quad in quads {
-                    paint_sprite_quad(target, source, *quad, *sample_kind, state);
+                for triangle in triangles {
+                    paint_sprite_triangle(target, source, *triangle, *sample_kind, state);
                 }
             }
         }
@@ -559,91 +588,130 @@ fn clear_target_once(
     }
 }
 
-fn paint_solid_rect(target: &mut CpuSurface, rect: SolidRect, state: PaintState) {
-    if !(rect.w > 0.0 && rect.h > 0.0) {
-        return;
-    }
-    let (x0, y0, x1, y1) = rect_bounds(rect.x, rect.y, rect.w, rect.h);
-    let clip = clipped_bounds(target, state.scissor, x0, y0, x1, y1);
-    for y in clip.1..clip.3 {
-        for x in clip.0..clip.2 {
-            put_pixel(target, x, y, rect.color, state.blend);
-        }
-    }
+fn paint_solid_triangle(target: &mut CpuSurface, triangle: SolidTriangle, state: PaintState) {
+    let positions = triangle
+        .vertices
+        .map(|vertex| ndc_to_surface(vertex.x, vertex.y, target.width, target.height));
+    rasterize_triangle(target, positions, state.scissor, |target, x, y, weights| {
+        let color = interpolate_color(
+            triangle.vertices[0].color,
+            triangle.vertices[1].color,
+            triangle.vertices[2].color,
+            weights,
+        );
+        put_pixel(target, x, y, color, state.blend);
+    });
 }
 
-fn paint_sprite_quad(
+fn paint_sprite_triangle(
     target: &mut CpuSurface,
     source: SourceView<'_>,
-    quad: SpriteQuad,
+    triangle: SpriteTriangle,
     sample_kind: TextureSampleKind,
     state: PaintState,
 ) {
-    let min_x = quad
-        .c0
-        .x
-        .min(quad.c1.x)
-        .min(quad.c2.x)
-        .min(quad.c3.x)
-        .floor() as i32;
-    let min_y = quad
-        .c0
-        .y
-        .min(quad.c1.y)
-        .min(quad.c2.y)
-        .min(quad.c3.y)
-        .floor() as i32;
-    let max_x = quad
-        .c0
-        .x
-        .max(quad.c1.x)
-        .max(quad.c2.x)
-        .max(quad.c3.x)
-        .ceil() as i32;
-    let max_y = quad
-        .c0
-        .y
-        .max(quad.c1.y)
-        .max(quad.c2.y)
-        .max(quad.c3.y)
-        .ceil() as i32;
-    let clip = clipped_bounds(target, state.scissor, min_x, min_y, max_x, max_y);
-    let ux_x = quad.c1.x - quad.c0.x;
-    let ux_y = quad.c1.y - quad.c0.y;
-    let vy_x = quad.c3.x - quad.c0.x;
-    let vy_y = quad.c3.y - quad.c0.y;
-    let det = ux_x * vy_y - ux_y * vy_x;
-    if det.abs() < 0.0001 {
+    let positions = triangle
+        .vertices
+        .map(|vertex| ndc_to_surface(vertex.x, vertex.y, target.width, target.height));
+    rasterize_triangle(target, positions, state.scissor, |target, x, y, weights| {
+        let u = interpolate_f32(
+            triangle.vertices[0].u,
+            triangle.vertices[1].u,
+            triangle.vertices[2].u,
+            weights,
+        );
+        let v = interpolate_f32(
+            triangle.vertices[0].v,
+            triangle.vertices[1].v,
+            triangle.vertices[2].v,
+            weights,
+        );
+        let tint = interpolate_color(
+            triangle.vertices[0].color,
+            triangle.vertices[1].color,
+            triangle.vertices[2].color,
+            weights,
+        );
+        let texel = sample(source, u, v, state.sampler, state.effect);
+        let color = texture_color(texel, tint, sample_kind);
+        if color.a != 0 {
+            put_pixel(target, x, y, color, state.blend);
+        }
+    });
+}
+
+fn ndc_to_surface(x: f32, y: f32, width: u32, height: u32) -> (f32, f32) {
+    (
+        (x * 0.5 + 0.5) * width as f32,
+        (0.5 - y * 0.5) * height as f32,
+    )
+}
+
+fn rasterize_triangle(
+    target: &mut CpuSurface,
+    positions: [(f32, f32); 3],
+    scissor: Option<ScissorRect>,
+    mut paint: impl FnMut(&mut CpuSurface, i32, i32, [f32; 3]),
+) {
+    let area = edge(positions[0], positions[1], positions[2]);
+    if !area.is_finite() || area.abs() < f32::EPSILON {
         return;
     }
-    let inv_det = 1.0 / det;
+    let min_x = positions
+        .iter()
+        .map(|position| position.0)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32;
+    let min_y = positions
+        .iter()
+        .map(|position| position.1)
+        .fold(f32::INFINITY, f32::min)
+        .floor() as i32;
+    let max_x = positions
+        .iter()
+        .map(|position| position.0)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32;
+    let max_y = positions
+        .iter()
+        .map(|position| position.1)
+        .fold(f32::NEG_INFINITY, f32::max)
+        .ceil() as i32;
+    let clip = clipped_bounds(target, scissor, min_x, min_y, max_x, max_y);
     for y in clip.1..clip.3 {
         for x in clip.0..clip.2 {
-            let px = x as f32 + 0.5 - quad.c0.x;
-            let py = y as f32 + 0.5 - quad.c0.y;
-            let s = (px * vy_y - py * vy_x) * inv_det;
-            let t = (ux_x * py - ux_y * px) * inv_det;
-            if !(0.0..=1.0).contains(&s) || !(0.0..=1.0).contains(&t) {
-                continue;
+            let point = (x as f32 + 0.5, y as f32 + 0.5);
+            let weights = [
+                edge(positions[1], positions[2], point) / area,
+                edge(positions[2], positions[0], point) / area,
+                edge(positions[0], positions[1], point) / area,
+            ];
+            if weights.iter().all(|weight| *weight >= -0.0001) {
+                paint(target, x, y, weights);
             }
-            let u = lerp2(quad.c0.u, quad.c1.u, quad.c2.u, quad.c3.u, s, t);
-            let v = lerp2(quad.c0.v, quad.c1.v, quad.c2.v, quad.c3.v, s, t);
-            let texel = sample(source, u, v, state.sampler, state.effect);
-            let color = texture_color(texel, quad.color, sample_kind);
-            if color.a == 0 {
-                continue;
-            }
-            put_pixel(target, x, y, color, state.blend);
         }
     }
 }
 
-fn rect_bounds(x: f32, y: f32, w: f32, h: f32) -> (i32, i32, i32, i32) {
-    (
-        x.floor() as i32,
-        y.floor() as i32,
-        (x + w).ceil() as i32,
-        (y + h).ceil() as i32,
+fn edge(a: (f32, f32), b: (f32, f32), point: (f32, f32)) -> f32 {
+    (point.0 - a.0) * (b.1 - a.1) - (point.1 - a.1) * (b.0 - a.0)
+}
+
+fn interpolate_f32(a: f32, b: f32, c: f32, weights: [f32; 3]) -> f32 {
+    a * weights[0] + b * weights[1] + c * weights[2]
+}
+
+fn interpolate_color(a: Rgba8, b: Rgba8, c: Rgba8, weights: [f32; 3]) -> Rgba8 {
+    let channel = |a: u8, b: u8, c: u8| {
+        interpolate_f32(a as f32, b as f32, c as f32, weights)
+            .round()
+            .clamp(0.0, 255.0) as u8
+    };
+    Rgba8::new(
+        channel(a.r, b.r, c.r),
+        channel(a.g, b.g, c.g),
+        channel(a.b, b.b, c.b),
+        channel(a.a, b.a, c.a),
     )
 }
 
@@ -889,4 +957,63 @@ fn mul_u8(a: u8, b: u8) -> u8 {
 
 fn byte_len(width: u32, height: u32) -> usize {
     width as usize * height as usize * 4
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::records::{SpriteTriangle, SpriteVertex};
+
+    #[test]
+    fn textured_triangle_pair_covers_the_present_surface() {
+        let mut textures = TextureRegistry::default();
+        assert_eq!(
+            textures.upload_rgba(1, 2, 2, vec![40, 80, 120, 255].repeat(4)),
+            0
+        );
+        let vertex = |x, y, u, v| SpriteVertex {
+            x,
+            y,
+            u,
+            v,
+            color: Rgba8::WHITE,
+        };
+        let frame = Frame {
+            seq: 1,
+            logical_width: 8,
+            logical_height: 8,
+            clear_rgb: 0,
+            allow_present: true,
+            preserve_contents: false,
+            commands: vec![FrameCommand::DrawSprite {
+                tex_id: 1,
+                sample_kind: TextureSampleKind::Rgba,
+                triangles: vec![
+                    SpriteTriangle {
+                        vertices: [
+                            vertex(-1.0, 1.0, 0.0, 0.0),
+                            vertex(1.0, 1.0, 1.0, 0.0),
+                            vertex(1.0, -1.0, 1.0, 1.0),
+                        ],
+                    },
+                    SpriteTriangle {
+                        vertices: [
+                            vertex(-1.0, 1.0, 0.0, 0.0),
+                            vertex(1.0, -1.0, 1.0, 1.0),
+                            vertex(-1.0, -1.0, 0.0, 1.0),
+                        ],
+                    },
+                ],
+            }],
+        };
+        let mut surfaces = HashMap::new();
+        let rendered = paint_frame(&textures, &frame, &mut surfaces, 8, 8).unwrap();
+        assert_eq!(rendered.rgba.len(), 8 * 8 * 4);
+        assert!(
+            rendered
+                .rgba
+                .chunks_exact(4)
+                .all(|pixel| pixel == [40, 80, 120, 255])
+        );
+    }
 }

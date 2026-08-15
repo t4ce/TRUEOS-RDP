@@ -1,4 +1,4 @@
-use crate::records::{SolidRect, SpriteQuad};
+use crate::records::{SolidTriangle, SpriteTriangle};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum BlendFactor {
@@ -156,12 +156,12 @@ pub enum FrameCommand {
     SetScissor(Option<ScissorRect>),
     SetRenderTarget(u32),
     DrawSolid {
-        rects: Vec<SolidRect>,
+        triangles: Vec<SolidTriangle>,
     },
     DrawSprite {
         tex_id: u32,
         sample_kind: TextureSampleKind,
-        quads: Vec<SpriteQuad>,
+        triangles: Vec<SpriteTriangle>,
     },
 }
 

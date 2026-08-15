@@ -2,7 +2,7 @@ use crate::command::{
     BlendState, Frame, FrameCommand, SamplerState, TextureEffect, TextureSampleKind,
 };
 use crate::records::{
-    decode_solid_rects, decode_sprite_quads, usable_solid_len, usable_sprite_len,
+    decode_solid_triangles, decode_sprite_triangles, usable_solid_len, usable_sprite_len,
 };
 use crate::texture::TextureRegistry;
 
@@ -219,7 +219,7 @@ impl Adapter {
             .draw_bytes
             .saturating_add(usable.min(u32::MAX as usize) as u32);
         self.commands.push(FrameCommand::DrawSolid {
-            rects: decode_solid_rects(&bytes[..usable]),
+            triangles: decode_solid_triangles(&bytes[..usable]),
         });
         0
     }
@@ -258,7 +258,7 @@ impl Adapter {
         self.commands.push(FrameCommand::DrawSprite {
             tex_id,
             sample_kind,
-            quads: decode_sprite_quads(&bytes[..usable]),
+            triangles: decode_sprite_triangles(&bytes[..usable]),
         });
         0
     }
