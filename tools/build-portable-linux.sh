@@ -20,6 +20,23 @@ readonly DIST_DIR="${REPO_DIR}/dist"
 readonly BUNDLE_DIR="${DIST_DIR}/${BUNDLE_NAME}"
 readonly BUNDLE_ARCHIVE="${DIST_DIR}/${BUNDLE_NAME}.tar.xz"
 readonly RELEASE_BINARY="${REPO_DIR}/target/${RUST_TARGET}/release/trueos-rdp"
+LINUX_PACKAGING_DIR=
+for candidate in \
+    "${REPO_DIR}/tools/packaging/linux" \
+    "${REPO_DIR}/packaging/linux"
+do
+    if [[ -d "${candidate}" ]]; then
+        LINUX_PACKAGING_DIR="${candidate}"
+        break
+    fi
+done
+
+if [[ -z "${LINUX_PACKAGING_DIR}" ]]; then
+    printf 'Missing Linux packaging payload in expected paths\n' >&2
+    exit 1
+fi
+
+readonly LINUX_PACKAGING_DIR
 
 for command_name in cargo curl readelf rustup sha256sum tar; do
     if ! command -v "${command_name}" >/dev/null 2>&1; then
@@ -88,8 +105,8 @@ fi
 rm -rf -- "${BUNDLE_DIR}"
 install -d "${BUNDLE_DIR}"
 install -m 0755 "${RELEASE_BINARY}" "${BUNDLE_DIR}/trueos-rdp"
-install -m 0755 "${REPO_DIR}/packaging/linux/run.sh" "${BUNDLE_DIR}/run.sh"
-install -m 0644 "${REPO_DIR}/packaging/linux/README.txt" "${BUNDLE_DIR}/README.txt"
+    install -m 0755 "${LINUX_PACKAGING_DIR}/run.sh" "${BUNDLE_DIR}/run.sh"
+    install -m 0644 "${LINUX_PACKAGING_DIR}/README.txt" "${BUNDLE_DIR}/README.txt"
 
 rm -f -- "${BUNDLE_ARCHIVE}"
 tar --create --xz --file "${BUNDLE_ARCHIVE}" --directory "${DIST_DIR}" "${BUNDLE_NAME}"

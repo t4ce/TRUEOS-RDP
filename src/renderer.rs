@@ -143,9 +143,9 @@ pub struct WgpuHeadlessRenderer {
 impl WgpuRenderer {
     pub fn new(window: Arc<Window>) -> Result<Self, RenderError> {
         let backends = desktop_backends();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
             .create_surface(window.clone())
@@ -155,19 +155,25 @@ impl WgpuRenderer {
             power_preference,
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
-        }))
-        .ok_or(RenderError::AdapterUnavailable)?;
+            apply_limit_buckets: false,
+        }));
+        let adapter = match adapter {
+            Ok(adapter) => adapter,
+            Err(_) => return Err(RenderError::AdapterUnavailable),
+        };
         let info = adapter.get_info();
-        let (device, queue) = block_on(adapter.request_device(
+        let (device, queue) = match block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("adapterlibgfx-copy-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
             },
-            None,
-        ))
-        .map_err(|error| RenderError::DeviceUnavailable(error.to_string()))?;
+        )) {
+            Ok((device, queue)) => (device, queue),
+            Err(error) => return Err(RenderError::DeviceUnavailable(error.to_string())),
+        };
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
         let format = caps
@@ -200,6 +206,7 @@ impl WgpuRenderer {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
@@ -262,14 +269,31 @@ impl WgpuRenderer {
         }
 
         let surface_frame = match self.surface.get_current_texture() {
-            Ok(texture) => texture,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.resize(self.window.inner_size());
-                self.surface
-                    .get_current_texture()
-                    .map_err(|error| RenderError::Surface(error.to_string()))?
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(texture) => texture,
+                    wgpu::CurrentSurfaceTexture::Suboptimal(texture) => texture,
+                    wgpu::CurrentSurfaceTexture::Outdated => {
+                        return Err(RenderError::Surface("surface still outdated".into()))
+                    }
+                    wgpu::CurrentSurfaceTexture::Lost => {
+                        return Err(RenderError::Surface("surface lost".into()))
+                    }
+                    wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
+                    wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+                    wgpu::CurrentSurfaceTexture::Validation => {
+                        return Err(RenderError::Surface("validation error".into()))
+                    }
+                }
             }
-            Err(error) => return Err(RenderError::Surface(error.to_string())),
+            wgpu::CurrentSurfaceTexture::Timeout => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Occluded => return Ok(()),
+            wgpu::CurrentSurfaceTexture::Validation => {
+                return Err(RenderError::Surface("validation error".into()))
+            }
         };
         let present = scale_surface(&logical, self.config.width, self.config.height);
         let upload = surface_upload_bytes(&present, self.config.format, &mut self.upload_scratch);
@@ -293,7 +317,7 @@ impl WgpuRenderer {
             },
         );
         self.queue.submit(std::iter::empty());
-        surface_frame.present();
+        self.queue.present(surface_frame);
         Ok(())
     }
 }
@@ -341,7 +365,7 @@ fn surface_upload_bytes<'a>(
 impl WgpuHeadlessRenderer {
     pub fn new_intel(width: u32, height: u32) -> Result<Self, RenderError> {
         let instance = wgpu::Instance::default();
-        let adapters = instance.enumerate_adapters(wgpu::Backends::all());
+        let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::all()));
         let adapter = adapters
             .into_iter()
             .find(|adapter| adapter.get_info().vendor == 0x8086)
@@ -351,16 +375,18 @@ impl WgpuHeadlessRenderer {
             "adapterlibgfx headless selected: backend={:?} vendor=0x{:04X} device=0x{:04X} name={}",
             info.backend, info.vendor, info.device, info.name
         );
-        let (device, queue) = block_on(adapter.request_device(
+        let (device, queue) = match block_on(adapter.request_device(
             &wgpu::DeviceDescriptor {
                 label: Some("adapterlibgfx-headless-copy-device"),
                 required_features: wgpu::Features::empty(),
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::Performance,
+                ..Default::default()
             },
-            None,
-        ))
-        .map_err(|error| RenderError::DeviceUnavailable(error.to_string()))?;
+        )) {
+            Ok((device, queue)) => (device, queue),
+            Err(error) => return Err(RenderError::DeviceUnavailable(error.to_string())),
+        };
         Ok(Self {
             _device: device,
             _queue: queue,
