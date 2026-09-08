@@ -135,12 +135,7 @@ impl HidUdpSender {
     }
 
     fn send_control(&self, seq: u32, flags: u16) -> io::Result<()> {
-        self.send_hid_packet(
-            HID_UDP_KIND_CONTROL,
-            flags,
-            seq,
-            &[],
-        )
+        self.send_hid_packet(HID_UDP_KIND_CONTROL, flags, seq, &[])
     }
 
     fn send_tablet(&self, seq: u32, input: TabletInput) -> io::Result<()> {
@@ -195,9 +190,7 @@ fn send_input(
 ) -> io::Result<()> {
     match input {
         RemoteInput::Tablet(input) => sender.send_tablet(sequences.next_tablet(), input),
-        RemoteInput::TabletDelta(input) => {
-            sender.send_tablet_delta(sequences.next_tablet(), input)
-        }
+        RemoteInput::TabletDelta(input) => sender.send_tablet_delta(sequences.next_tablet(), input),
         RemoteInput::Keyboard(input) => sender.send_keyboard(sequences.next_keyboard(), input),
         RemoteInput::SetPointerMode { relative } => sender.send_control(
             sequences.next_control(),
@@ -392,7 +385,10 @@ mod tests {
         });
         assert_eq!(i32::from_le_bytes(payload[0..4].try_into().unwrap()), -321);
         assert_eq!(i32::from_le_bytes(payload[4..8].try_into().unwrap()), 654);
-        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 0x1234_5678);
+        assert_eq!(
+            u32::from_le_bytes(payload[8..12].try_into().unwrap()),
+            0x1234_5678
+        );
         assert_eq!(i16::from_le_bytes(payload[12..14].try_into().unwrap()), -7);
     }
 

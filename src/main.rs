@@ -158,12 +158,14 @@ impl Viewer {
     }
 
     fn emit_mouse(&self, dx: i16, dy: i16, wheel: i16) {
-        let _ = self.input_tx.send(RemoteInput::TabletDelta(TabletDeltaInput {
-            buttons_down: self.buttons_down,
-            dx,
-            dy,
-            wheel,
-        }));
+        let _ = self
+            .input_tx
+            .send(RemoteInput::TabletDelta(TabletDeltaInput {
+                buttons_down: self.buttons_down,
+                dx,
+                dy,
+                wheel,
+            }));
     }
 
     fn delta_mode(&self) -> bool {

@@ -5,7 +5,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
-use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
@@ -135,6 +137,7 @@ pub struct WgpuWindowApp<P> {
     renderer: Option<WgpuRenderer>,
     last_error: Option<RenderError>,
     last_raw_mouse_motion: Option<Instant>,
+    applied_cursor_delta_mode: Option<bool>,
 }
 
 fn new_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
@@ -356,6 +359,7 @@ impl<P> WgpuWindowApp<P> {
             renderer: None,
             last_error: None,
             last_raw_mouse_motion: None,
+            applied_cursor_delta_mode: None,
         }
     }
 
@@ -794,7 +798,9 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         };
         let window = Arc::new(window);
-        sync_cursor_mode(&window, &self.producer);
+        let delta = self.producer.cursor_delta_mode();
+        sync_cursor_mode(&window, &self.producer, delta);
+        self.applied_cursor_delta_mode = Some(delta);
         match WgpuRenderer::new(window.clone()) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
@@ -818,8 +824,8 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         }
 
-        let delta_cursor_event = self.producer.cursor_delta_mode()
-            && matches!(event, WindowEvent::CursorMoved { .. });
+        let delta_cursor_event =
+            self.producer.cursor_delta_mode() && matches!(event, WindowEvent::CursorMoved { .. });
         if delta_cursor_event {
             if let WindowEvent::CursorMoved { position, .. } = &event
                 && self
@@ -836,9 +842,8 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                     self.producer
                         .handle_input(InputEvent::MouseMotionDelta { dx, dy });
                 }
-                let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
-                    center_x, center_y,
-                ));
+                let _ = window
+                    .set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
             }
         } else if let Some(input) = input_event(&event) {
             self.producer.handle_input(input);
@@ -879,13 +884,18 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                     }
                 }
                 if let Some(window) = &self.window {
-                    sync_cursor_mode(window, &self.producer);
+                    let delta = self.producer.cursor_delta_mode();
+                    let entering_delta = self.applied_cursor_delta_mode != Some(delta) && delta;
+                    if self.applied_cursor_delta_mode != Some(delta) {
+                        self.last_raw_mouse_motion = None;
+                    }
+                    sync_cursor_mode(window, &self.producer, entering_delta);
+                    self.applied_cursor_delta_mode = Some(delta);
                 }
             }
             _ => {}
         }
     }
-
 
     fn device_event(
         &mut self,
@@ -909,17 +919,19 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
     }
 }
 
-fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P) {
+fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P, entering_delta: bool) {
     let delta = producer.cursor_delta_mode();
     if delta {
         let _ = window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
-        let size = window.inner_size();
-        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
-            f64::from(size.width) * 0.5,
-            f64::from(size.height) * 0.5,
-        ));
+        if entering_delta {
+            let size = window.inner_size();
+            let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
+                f64::from(size.width) * 0.5,
+                f64::from(size.height) * 0.5,
+            ));
+        }
     } else {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
     }
