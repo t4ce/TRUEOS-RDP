@@ -19,6 +19,8 @@ const HID_UDP_DEVICE_ID: u16 = 1;
 const CONTROL_MAGIC: &[u8; 4] = b"THIC";
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONTROL_RELEASE_CENTER_SNAP: u16 = 1 << 0;
+const CONTROL_POINTER_MODE_VALID: u16 = 1 << 1;
+const CONTROL_POINTER_MODE_RELATIVE: u16 = 1 << 2;
 const INPUT_FLAG_RELATIVE: u16 = 1 << 15;
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
@@ -32,7 +34,7 @@ pub enum RemoteInput {
     Tablet(TabletInput),
     TabletDelta(TabletDeltaInput),
     Keyboard(KeyboardInput),
-    ReleaseCenterSnap,
+    SetPointerMode { relative: bool },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -132,14 +134,10 @@ impl HidUdpSender {
         self.send_hid_packet(HID_UDP_KIND_TABLET, INPUT_FLAG_RELATIVE, seq, &payload)
     }
 
-    fn send_control(&self, seq: u32, release: bool) -> io::Result<()> {
+    fn send_control(&self, seq: u32, flags: u16) -> io::Result<()> {
         self.send_hid_packet(
             HID_UDP_KIND_CONTROL,
-            if release {
-                CONTROL_RELEASE_CENTER_SNAP
-            } else {
-                0
-            },
+            flags,
             seq,
             &[],
         )
@@ -201,8 +199,20 @@ fn send_input(
             sender.send_tablet_delta(sequences.next_tablet(), input)
         }
         RemoteInput::Keyboard(input) => sender.send_keyboard(sequences.next_keyboard(), input),
-        RemoteInput::ReleaseCenterSnap => sender.send_control(sequences.next_control(), true),
+        RemoteInput::SetPointerMode { relative } => sender.send_control(
+            sequences.next_control(),
+            pointer_mode_control_flags(relative),
+        ),
     }
+}
+
+fn pointer_mode_control_flags(relative: bool) -> u16 {
+    CONTROL_POINTER_MODE_VALID
+        | if relative {
+            CONTROL_POINTER_MODE_RELATIVE
+        } else {
+            CONTROL_RELEASE_CENTER_SNAP
+        }
 }
 
 fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool, release_pending: &mut bool) {
@@ -239,6 +249,7 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
         let mut last_attempt = None;
         let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
         let mut release_pending = false;
+        let mut local_pointer_mode = None;
         loop {
             let current_host = target.host();
             if current_host != active_host {
@@ -289,8 +300,11 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
                 receive_control(connected, &sender_center_snap, &mut release_pending);
                 if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
                     last_control_poll = Instant::now();
+                    let flags = local_pointer_mode
+                        .map(pointer_mode_control_flags)
+                        .unwrap_or(0);
                     if connected
-                        .send_control(sequences.next_control(), false)
+                        .send_control(sequences.next_control(), flags)
                         .is_err()
                     {
                         sender = None;
@@ -301,16 +315,24 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
 
             match input_rx.recv_timeout(READ_TIMEOUT) {
                 Ok(input) => {
-                    let releases_center_snap = matches!(&input, RemoteInput::ReleaseCenterSnap);
+                    let pointer_mode = match &input {
+                        RemoteInput::SetPointerMode { relative } => Some(*relative),
+                        _ => None,
+                    };
+                    if let Some(relative) = pointer_mode {
+                        local_pointer_mode = Some(relative);
+                    }
                     if let Some(connected) = sender.as_ref()
                         && let Err(error) = send_input(connected, &mut sequences, input)
                     {
                         eprintln!("trueos-rdp: UDP HID send failed: {error}");
                         sender = None;
                         sender_center_snap.store(false, Ordering::Release);
-                    } else if releases_center_snap {
-                        release_pending = true;
-                        sender_center_snap.store(false, Ordering::Release);
+                    } else if let Some(relative) = pointer_mode {
+                        release_pending = !relative;
+                        if !relative {
+                            sender_center_snap.store(false, Ordering::Release);
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -372,5 +394,17 @@ mod tests {
         assert_eq!(i32::from_le_bytes(payload[4..8].try_into().unwrap()), 654);
         assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 0x1234_5678);
         assert_eq!(i16::from_le_bytes(payload[12..14].try_into().unwrap()), -7);
+    }
+
+    #[test]
+    fn pointer_mode_control_is_an_explicit_flip() {
+        assert_eq!(
+            pointer_mode_control_flags(true),
+            CONTROL_POINTER_MODE_VALID | CONTROL_POINTER_MODE_RELATIVE
+        );
+        assert_eq!(
+            pointer_mode_control_flags(false),
+            CONTROL_POINTER_MODE_VALID | CONTROL_RELEASE_CENTER_SNAP
+        );
     }
 }

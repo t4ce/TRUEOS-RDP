@@ -79,6 +79,7 @@ struct Viewer {
     telemetry_disabled: bool,
     suppress_telemetry_release: bool,
     center_snap: Arc<AtomicBool>,
+    local_delta_mode: Option<bool>,
     suppress_space_release: bool,
 }
 
@@ -116,6 +117,7 @@ impl Viewer {
             telemetry_disabled: false,
             suppress_telemetry_release: false,
             center_snap,
+            local_delta_mode: None,
             suppress_space_release: false,
         }
     }
@@ -165,7 +167,8 @@ impl Viewer {
     }
 
     fn delta_mode(&self) -> bool {
-        self.center_snap.load(Ordering::Acquire)
+        self.local_delta_mode
+            .unwrap_or_else(|| self.center_snap.load(Ordering::Acquire))
     }
 
     fn emit_keyboard(&self) {
@@ -392,9 +395,15 @@ impl FrameProducer for Viewer {
         } = &event
         {
             if *state == InputButtonState::Pressed && self.keyboard_modifiers & 0x11 != 0 {
-                self.center_snap.store(false, Ordering::Release);
+                let enabled = !self.delta_mode();
+                self.local_delta_mode = Some(enabled);
                 self.suppress_space_release = true;
-                let _ = self.input_tx.send(RemoteInput::ReleaseCenterSnap);
+                let _ = self
+                    .input_tx
+                    .send(RemoteInput::SetPointerMode { relative: enabled });
+                if !enabled {
+                    self.center_snap.store(false, Ordering::Release);
+                }
                 return;
             }
             if *state == InputButtonState::Released && self.suppress_space_release {
@@ -1352,6 +1361,49 @@ mod tests {
         assert_eq!(rect.height, 1080.0);
         assert_eq!(rect.width, 1920.0);
         assert_eq!(rect.x, 320.0);
+    }
+
+    #[test]
+    fn ctrl_space_toggles_local_delta_mode() {
+        let target = RemoteTarget::new(DEFAULT_HOST);
+        let (input_tx, input_rx) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            None,
+            input_tx,
+            target,
+            DEFAULT_HOST.to_string(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        viewer.keyboard_modifiers = 1;
+
+        let press = InputEvent::KeyboardInput {
+            hid_keycode: 0x2C,
+            codepoint: u32::from(' '),
+            modifiers: 1,
+            state: InputButtonState::Pressed,
+        };
+        let release = InputEvent::KeyboardInput {
+            hid_keycode: 0x2C,
+            codepoint: u32::from(' '),
+            modifiers: 1,
+            state: InputButtonState::Released,
+        };
+        viewer.handle_input(press.clone());
+        assert!(viewer.delta_mode());
+        viewer.handle_input(release.clone());
+
+        viewer.handle_input(press);
+        assert!(!viewer.delta_mode());
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(RemoteInput::SetPointerMode { relative: true })
+        ));
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(RemoteInput::SetPointerMode { relative: false })
+        ));
+        viewer.handle_input(release);
     }
 
     #[test]

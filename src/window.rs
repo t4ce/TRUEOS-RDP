@@ -2,6 +2,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -133,6 +134,7 @@ pub struct WgpuWindowApp<P> {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     last_error: Option<RenderError>,
+    last_raw_mouse_motion: Option<Instant>,
 }
 
 fn new_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
@@ -353,6 +355,7 @@ impl<P> WgpuWindowApp<P> {
             window: None,
             renderer: None,
             last_error: None,
+            last_raw_mouse_motion: None,
         }
     }
 
@@ -815,7 +818,29 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         }
 
-        if let Some(input) = input_event(&event) {
+        let delta_cursor_event = self.producer.cursor_delta_mode()
+            && matches!(event, WindowEvent::CursorMoved { .. });
+        if delta_cursor_event {
+            if let WindowEvent::CursorMoved { position, .. } = &event
+                && self
+                    .last_raw_mouse_motion
+                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
+                && let Some(window) = &self.window
+            {
+                let size = window.inner_size();
+                let center_x = f64::from(size.width) * 0.5;
+                let center_y = f64::from(size.height) * 0.5;
+                let dx = position.x - center_x;
+                let dy = position.y - center_y;
+                if dx.abs() > 0.25 || dy.abs() > 0.25 {
+                    self.producer
+                        .handle_input(InputEvent::MouseMotionDelta { dx, dy });
+                }
+                let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
+                    center_x, center_y,
+                ));
+            }
+        } else if let Some(input) = input_event(&event) {
             self.producer.handle_input(input);
         }
         if let Some(input) = keyboard_input_event(&event) {
@@ -871,6 +896,7 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         if self.producer.cursor_delta_mode()
             && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
         {
+            self.last_raw_mouse_motion = Some(Instant::now());
             self.producer
                 .handle_input(InputEvent::MouseMotionDelta { dx, dy });
         }
@@ -889,6 +915,11 @@ fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P) {
         let _ = window
             .set_cursor_grab(CursorGrabMode::Locked)
             .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        let size = window.inner_size();
+        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
+            f64::from(size.width) * 0.5,
+            f64::from(size.height) * 0.5,
+        ));
     } else {
         let _ = window.set_cursor_grab(CursorGrabMode::None);
     }
