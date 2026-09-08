@@ -25,7 +25,7 @@ use crate::window::{
     FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
 };
 
-use crate::input::{KeyboardInput, MouseInput, RemoteInput, TabletInput};
+use crate::input::{KeyboardInput, RemoteInput, TabletDeltaInput, TabletInput};
 use crate::media::{MediaConfig, MediaFeed, VideoFrame};
 use crate::target::{RemoteTarget, strip_port};
 use crate::telemetry::TelemetryHud;
@@ -156,7 +156,7 @@ impl Viewer {
     }
 
     fn emit_mouse(&self, dx: i16, dy: i16, wheel: i16) {
-        let _ = self.input_tx.send(RemoteInput::Mouse(MouseInput {
+        let _ = self.input_tx.send(RemoteInput::TabletDelta(TabletDeltaInput {
             buttons_down: self.buttons_down,
             dx,
             dy,
@@ -1364,6 +1364,7 @@ mod tests {
             target.clone(),
             DEFAULT_HOST.to_string(),
             false,
+            Arc::new(AtomicBool::new(false)),
         );
 
         assert!(!viewer.startup_host_mode);
@@ -1404,6 +1405,7 @@ mod tests {
             target.clone(),
             DEFAULT_HOST.to_string(),
             false,
+            Arc::new(AtomicBool::new(false)),
         );
         viewer.target_text.clear();
         viewer.handle_input(InputEvent::DigitPressed(1));

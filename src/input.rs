@@ -14,12 +14,12 @@ const HID_UDP_MAGIC: &[u8; 4] = b"THID";
 const HID_UDP_VERSION: u8 = 1;
 const HID_UDP_KIND_KEYBOARD: u8 = 2;
 const HID_UDP_KIND_TABLET: u8 = 3;
-const HID_UDP_KIND_MOUSE: u8 = 1;
 const HID_UDP_KIND_CONTROL: u8 = 4;
 const HID_UDP_DEVICE_ID: u16 = 1;
 const CONTROL_MAGIC: &[u8; 4] = b"THIC";
 const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CONTROL_RELEASE_CENTER_SNAP: u16 = 1 << 0;
+const INPUT_FLAG_RELATIVE: u16 = 1 << 15;
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -30,13 +30,13 @@ pub const INPUT_FLAG_BUTTONS: u16 = 1 << 2;
 #[derive(Clone, Copy, Debug)]
 pub enum RemoteInput {
     Tablet(TabletInput),
-    Mouse(MouseInput),
+    TabletDelta(TabletDeltaInput),
     Keyboard(KeyboardInput),
     ReleaseCenterSnap,
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct MouseInput {
+pub struct TabletDeltaInput {
     pub buttons_down: u32,
     pub dx: i16,
     pub dy: i16,
@@ -60,7 +60,6 @@ pub struct KeyboardInput {
 
 #[derive(Debug)]
 struct HidUdpSeqs {
-    mouse: u32,
     keyboard: u32,
     tablet: u32,
     control: u32,
@@ -73,7 +72,6 @@ impl HidUdpSeqs {
             .map(|duration| duration.as_millis() as u32)
             .unwrap_or(1);
         Self {
-            mouse: start,
             keyboard: start,
             tablet: start,
             control: start,
@@ -83,11 +81,6 @@ impl HidUdpSeqs {
     fn next_keyboard(&mut self) -> u32 {
         self.keyboard = self.keyboard.wrapping_add(1);
         self.keyboard
-    }
-
-    fn next_mouse(&mut self) -> u32 {
-        self.mouse = self.mouse.wrapping_add(1);
-        self.mouse
     }
 
     fn next_control(&mut self) -> u32 {
@@ -134,20 +127,19 @@ impl HidUdpSender {
         self.send_hid_packet(HID_UDP_KIND_KEYBOARD, 0, seq, &payload)
     }
 
-    fn send_mouse(&self, seq: u32, input: MouseInput) -> io::Result<()> {
-        let payload = [
-            input.buttons_down.min(u8::MAX as u32) as u8,
-            input.dx.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
-            input.dy.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
-            input.wheel.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
-        ];
-        self.send_hid_packet(HID_UDP_KIND_MOUSE, 0, seq, &payload)
+    fn send_tablet_delta(&self, seq: u32, input: TabletDeltaInput) -> io::Result<()> {
+        let payload = encode_tablet_delta_payload(input);
+        self.send_hid_packet(HID_UDP_KIND_TABLET, INPUT_FLAG_RELATIVE, seq, &payload)
     }
 
     fn send_control(&self, seq: u32, release: bool) -> io::Result<()> {
         self.send_hid_packet(
             HID_UDP_KIND_CONTROL,
-            if release { CONTROL_RELEASE_CENTER_SNAP } else { 0 },
+            if release {
+                CONTROL_RELEASE_CENTER_SNAP
+            } else {
+                0
+            },
             seq,
             &[],
         )
@@ -176,6 +168,15 @@ impl HidUdpSender {
     }
 }
 
+fn encode_tablet_delta_payload(input: TabletDeltaInput) -> [u8; 16] {
+    let mut payload = [0u8; 16];
+    payload[0..4].copy_from_slice(&(i32::from(input.dx) as u32).to_le_bytes());
+    payload[4..8].copy_from_slice(&(i32::from(input.dy) as u32).to_le_bytes());
+    payload[8..12].copy_from_slice(&input.buttons_down.to_le_bytes());
+    payload[12..14].copy_from_slice(&input.wheel.to_le_bytes());
+    payload
+}
+
 fn encode_hid_packet(kind: u8, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
     let mut packet = Vec::with_capacity(16 + payload.len());
     packet.extend_from_slice(HID_UDP_MAGIC);
@@ -196,13 +197,15 @@ fn send_input(
 ) -> io::Result<()> {
     match input {
         RemoteInput::Tablet(input) => sender.send_tablet(sequences.next_tablet(), input),
-        RemoteInput::Mouse(input) => sender.send_mouse(sequences.next_mouse(), input),
+        RemoteInput::TabletDelta(input) => {
+            sender.send_tablet_delta(sequences.next_tablet(), input)
+        }
         RemoteInput::Keyboard(input) => sender.send_keyboard(sequences.next_keyboard(), input),
         RemoteInput::ReleaseCenterSnap => sender.send_control(sequences.next_control(), true),
     }
 }
 
-fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool) {
+fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool, release_pending: &mut bool) {
     let mut reply = [0u8; 32];
     loop {
         match sender.socket.recv(&mut reply) {
@@ -211,7 +214,13 @@ fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool) {
                     && reply[4] == HID_UDP_VERSION
                     && u16::from_le_bytes([reply[6], reply[7]]) == HID_UDP_DEVICE_ID =>
             {
-                center_snap.store(reply[5] & 1 != 0, Ordering::Release);
+                let enabled = reply[5] & 1 != 0;
+                if !enabled {
+                    *release_pending = false;
+                }
+                if !*release_pending {
+                    center_snap.store(enabled, Ordering::Release);
+                }
             }
             Ok(_) => {}
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
@@ -229,12 +238,15 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
         let mut active_host = String::new();
         let mut last_attempt = None;
         let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
+        let mut release_pending = false;
         loop {
             let current_host = target.host();
             if current_host != active_host {
                 active_host = current_host;
                 sender = None;
                 last_attempt = None;
+                release_pending = false;
+                sender_center_snap.store(false, Ordering::Release);
             }
 
             if sender.is_none()
@@ -273,9 +285,8 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
                 }
             }
 
-
             if let Some(connected) = sender.as_ref() {
-                receive_control(connected, &sender_center_snap);
+                receive_control(connected, &sender_center_snap, &mut release_pending);
                 if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
                     last_control_poll = Instant::now();
                     if connected
@@ -290,11 +301,16 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
 
             match input_rx.recv_timeout(READ_TIMEOUT) {
                 Ok(input) => {
+                    let releases_center_snap = matches!(&input, RemoteInput::ReleaseCenterSnap);
                     if let Some(connected) = sender.as_ref()
                         && let Err(error) = send_input(connected, &mut sequences, input)
                     {
                         eprintln!("trueos-rdp: UDP HID send failed: {error}");
                         sender = None;
+                        sender_center_snap.store(false, Ordering::Release);
+                    } else if releases_center_snap {
+                        release_pending = true;
+                        sender_center_snap.store(false, Ordering::Release);
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -342,5 +358,19 @@ mod tests {
                 4, 5, 6, 0, 0, 0,
             ]
         );
+    }
+
+    #[test]
+    fn tablet_delta_keeps_signed_motion_and_full_buttons() {
+        let payload = encode_tablet_delta_payload(TabletDeltaInput {
+            buttons_down: 0x1234_5678,
+            dx: -321,
+            dy: 654,
+            wheel: -7,
+        });
+        assert_eq!(i32::from_le_bytes(payload[0..4].try_into().unwrap()), -321);
+        assert_eq!(i32::from_le_bytes(payload[4..8].try_into().unwrap()), 654);
+        assert_eq!(u32::from_le_bytes(payload[8..12].try_into().unwrap()), 0x1234_5678);
+        assert_eq!(i16::from_le_bytes(payload[12..14].try_into().unwrap()), -7);
     }
 }
