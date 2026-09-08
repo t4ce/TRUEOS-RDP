@@ -4,10 +4,10 @@ use std::sync::{
 };
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
-use winit::window::{Window, WindowAttributes, WindowId};
+use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
 
 use crate::api::{Adapter, AdapterConfig};
 use crate::renderer::{RenderError, WgpuRenderer};
@@ -20,6 +20,10 @@ pub trait FrameProducer {
 
     fn cursor_visible(&self) -> bool {
         true
+    }
+
+    fn cursor_delta_mode(&self) -> bool {
+        false
     }
 
     fn window_decorations(&self) -> bool {
@@ -92,6 +96,10 @@ pub enum InputEvent {
         y: f32,
     },
     CursorLeft,
+    MouseMotionDelta {
+        dx: f64,
+        dy: f64,
+    },
     MouseButton {
         button: InputMouseButton,
         state: InputButtonState,
@@ -783,7 +791,7 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         };
         let window = Arc::new(window);
-        window.set_cursor_visible(self.producer.cursor_visible());
+        sync_cursor_mode(&window, &self.producer);
         match WgpuRenderer::new(window.clone()) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
@@ -846,10 +854,25 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                     }
                 }
                 if let Some(window) = &self.window {
-                    window.set_cursor_visible(self.producer.cursor_visible());
+                    sync_cursor_mode(window, &self.producer);
                 }
             }
             _ => {}
+        }
+    }
+
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        if self.producer.cursor_delta_mode()
+            && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+        {
+            self.producer
+                .handle_input(InputEvent::MouseMotionDelta { dx, dy });
         }
     }
 
@@ -858,6 +881,18 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             window.request_redraw();
         }
     }
+}
+
+fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P) {
+    let delta = producer.cursor_delta_mode();
+    if delta {
+        let _ = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+    } else {
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
+    }
+    window.set_cursor_visible(!delta && producer.cursor_visible());
 }
 
 impl<P: FrameProducer, S: FrameProducer> ApplicationHandler for WgpuTwoWindowApp<P, S> {

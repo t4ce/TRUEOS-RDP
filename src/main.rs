@@ -12,7 +12,11 @@ mod visual;
 mod window;
 
 use std::env;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, Sender},
+};
 use std::time::{Duration, Instant};
 
 use crate::api::{Adapter, AdapterConfig};
@@ -21,7 +25,7 @@ use crate::window::{
     FrameProducer, InputButtonState, InputEvent, InputKey, InputMouseButton, WgpuWindowApp,
 };
 
-use crate::input::{KeyboardInput, RemoteInput, TabletInput};
+use crate::input::{KeyboardInput, MouseInput, RemoteInput, TabletInput};
 use crate::media::{MediaConfig, MediaFeed, VideoFrame};
 use crate::target::{RemoteTarget, strip_port};
 use crate::telemetry::TelemetryHud;
@@ -74,6 +78,8 @@ struct Viewer {
     telemetry: Option<TelemetryHud>,
     telemetry_disabled: bool,
     suppress_telemetry_release: bool,
+    center_snap: Arc<AtomicBool>,
+    suppress_space_release: bool,
 }
 
 impl Viewer {
@@ -83,6 +89,7 @@ impl Viewer {
         target: RemoteTarget,
         target_text: String,
         no_view: bool,
+        center_snap: Arc<AtomicBool>,
     ) -> Self {
         let startup_host_mode = !looks_like_ip(&target_text);
         Self {
@@ -108,6 +115,8 @@ impl Viewer {
             telemetry: None,
             telemetry_disabled: false,
             suppress_telemetry_release: false,
+            center_snap,
+            suppress_space_release: false,
         }
     }
 
@@ -144,6 +153,19 @@ impl Viewer {
             wheel,
             flags,
         }));
+    }
+
+    fn emit_mouse(&self, dx: i16, dy: i16, wheel: i16) {
+        let _ = self.input_tx.send(RemoteInput::Mouse(MouseInput {
+            buttons_down: self.buttons_down,
+            dx,
+            dy,
+            wheel,
+        }));
+    }
+
+    fn delta_mode(&self) -> bool {
+        self.center_snap.load(Ordering::Acquire)
     }
 
     fn emit_keyboard(&self) {
@@ -322,14 +344,18 @@ impl FrameProducer for Viewer {
                 (rect.x + rect.width) / width * 2.0 - 1.0,
                 1.0 - (rect.y + rect.height) / height * 2.0,
             ],
-            overlay_vertices: local_cursor_vertices(
-                self.window_width,
-                self.window_height,
-                self.cursor_x,
-                self.cursor_y,
-                &self.cursor_trail,
-                Instant::now(),
-            ),
+            overlay_vertices: if self.delta_mode() {
+                Vec::new()
+            } else {
+                local_cursor_vertices(
+                    self.window_width,
+                    self.window_height,
+                    self.cursor_x,
+                    self.cursor_y,
+                    &self.cursor_trail,
+                    Instant::now(),
+                )
+            },
             telemetry: self.telemetry.as_ref().and_then(TelemetryHud::take_latest),
             telemetry_visible: self.telemetry.is_some(),
             telemetry_bounds: [
@@ -345,6 +371,10 @@ impl FrameProducer for Viewer {
         self.no_view || !self.have_video
     }
 
+    fn cursor_delta_mode(&self) -> bool {
+        self.delta_mode()
+    }
+
     fn window_resizable(&self) -> bool {
         true
     }
@@ -355,6 +385,23 @@ impl FrameProducer for Viewer {
     }
 
     fn handle_input(&mut self, event: InputEvent) {
+        if let InputEvent::KeyboardInput {
+            hid_keycode: 0x2C,
+            state,
+            ..
+        } = &event
+        {
+            if *state == InputButtonState::Pressed && self.keyboard_modifiers & 0x11 != 0 {
+                self.center_snap.store(false, Ordering::Release);
+                self.suppress_space_release = true;
+                let _ = self.input_tx.send(RemoteInput::ReleaseCenterSnap);
+                return;
+            }
+            if *state == InputButtonState::Released && self.suppress_space_release {
+                self.suppress_space_release = false;
+                return;
+            }
+        }
         if !self.no_view && !self.have_video {
             match event {
                 InputEvent::CursorMoved { x, y } => {
@@ -413,7 +460,17 @@ impl FrameProducer for Viewer {
         }
 
         match event {
+            InputEvent::MouseMotionDelta { dx, dy } if self.delta_mode() => {
+                self.emit_mouse(
+                    dx.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+                    dy.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16,
+                    0,
+                );
+            }
             InputEvent::CursorMoved { x, y } => {
+                if self.delta_mode() {
+                    return;
+                }
                 self.update_cursor_position(x, y, true);
                 self.emit_tablet(input::INPUT_FLAG_MOTION, 0);
             }
@@ -434,13 +491,21 @@ impl FrameProducer for Viewer {
                     InputButtonState::Pressed => self.buttons_down |= bit,
                     InputButtonState::Released => self.buttons_down &= !bit,
                 }
-                self.emit_tablet(input::INPUT_FLAG_BUTTONS, 0);
+                if self.delta_mode() {
+                    self.emit_mouse(0, 0, 0);
+                } else {
+                    self.emit_tablet(input::INPUT_FLAG_BUTTONS, 0);
+                }
             }
             InputEvent::MouseWheel { x, y } => {
                 let wheel = if y.abs() >= x.abs() { y } else { x };
                 let wheel = wheel.round().clamp(i16::MIN as f32, i16::MAX as f32) as i16;
                 if wheel != 0 {
-                    self.emit_tablet(input::INPUT_FLAG_WHEEL, wheel);
+                    if self.delta_mode() {
+                        self.emit_mouse(0, 0, wheel);
+                    } else {
+                        self.emit_tablet(input::INPUT_FLAG_WHEEL, wheel);
+                    }
                 }
             }
             InputEvent::KeyboardInput {
@@ -1206,7 +1271,7 @@ fn usage() {
 fn run(config: AppConfig) -> Result<(), String> {
     let target = RemoteTarget::new(config.host.clone());
     let (input_tx, input_rx): (Sender<RemoteInput>, Receiver<RemoteInput>) = mpsc::channel();
-    input::spawn_sender(target.clone(), input_rx);
+    let center_snap = input::spawn_sender(target.clone(), input_rx);
 
     let media = if config.no_view {
         None
@@ -1229,7 +1294,14 @@ fn run(config: AppConfig) -> Result<(), String> {
         }
     );
 
-    let viewer = Viewer::new(media, input_tx, target, config.host.clone(), config.no_view);
+    let viewer = Viewer::new(
+        media,
+        input_tx,
+        target,
+        config.host.clone(),
+        config.no_view,
+        center_snap,
+    );
     let app = WgpuWindowApp::new(
         format!("TRUEOS Remote Desktop — {}", config.host),
         AdapterConfig {

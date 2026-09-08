@@ -1,6 +1,10 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{Receiver, RecvTimeoutError},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -10,7 +14,12 @@ const HID_UDP_MAGIC: &[u8; 4] = b"THID";
 const HID_UDP_VERSION: u8 = 1;
 const HID_UDP_KIND_KEYBOARD: u8 = 2;
 const HID_UDP_KIND_TABLET: u8 = 3;
+const HID_UDP_KIND_MOUSE: u8 = 1;
+const HID_UDP_KIND_CONTROL: u8 = 4;
 const HID_UDP_DEVICE_ID: u16 = 1;
+const CONTROL_MAGIC: &[u8; 4] = b"THIC";
+const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CONTROL_RELEASE_CENTER_SNAP: u16 = 1 << 0;
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
 const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -21,7 +30,17 @@ pub const INPUT_FLAG_BUTTONS: u16 = 1 << 2;
 #[derive(Clone, Copy, Debug)]
 pub enum RemoteInput {
     Tablet(TabletInput),
+    Mouse(MouseInput),
     Keyboard(KeyboardInput),
+    ReleaseCenterSnap,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MouseInput {
+    pub buttons_down: u32,
+    pub dx: i16,
+    pub dy: i16,
+    pub wheel: i16,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -41,8 +60,10 @@ pub struct KeyboardInput {
 
 #[derive(Debug)]
 struct HidUdpSeqs {
+    mouse: u32,
     keyboard: u32,
     tablet: u32,
+    control: u32,
 }
 
 impl HidUdpSeqs {
@@ -52,14 +73,26 @@ impl HidUdpSeqs {
             .map(|duration| duration.as_millis() as u32)
             .unwrap_or(1);
         Self {
+            mouse: start,
             keyboard: start,
             tablet: start,
+            control: start,
         }
     }
 
     fn next_keyboard(&mut self) -> u32 {
         self.keyboard = self.keyboard.wrapping_add(1);
         self.keyboard
+    }
+
+    fn next_mouse(&mut self) -> u32 {
+        self.mouse = self.mouse.wrapping_add(1);
+        self.mouse
+    }
+
+    fn next_control(&mut self) -> u32 {
+        self.control = self.control.wrapping_add(1);
+        self.control
     }
 
     fn next_tablet(&mut self) -> u32 {
@@ -99,6 +132,25 @@ impl HidUdpSender {
             input.keys[5],
         ];
         self.send_hid_packet(HID_UDP_KIND_KEYBOARD, 0, seq, &payload)
+    }
+
+    fn send_mouse(&self, seq: u32, input: MouseInput) -> io::Result<()> {
+        let payload = [
+            input.buttons_down.min(u8::MAX as u32) as u8,
+            input.dx.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
+            input.dy.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
+            input.wheel.clamp(i8::MIN as i16, i8::MAX as i16) as i8 as u8,
+        ];
+        self.send_hid_packet(HID_UDP_KIND_MOUSE, 0, seq, &payload)
+    }
+
+    fn send_control(&self, seq: u32, release: bool) -> io::Result<()> {
+        self.send_hid_packet(
+            HID_UDP_KIND_CONTROL,
+            if release { CONTROL_RELEASE_CENTER_SNAP } else { 0 },
+            seq,
+            &[],
+        )
     }
 
     fn send_tablet(&self, seq: u32, input: TabletInput) -> io::Result<()> {
@@ -144,16 +196,39 @@ fn send_input(
 ) -> io::Result<()> {
     match input {
         RemoteInput::Tablet(input) => sender.send_tablet(sequences.next_tablet(), input),
+        RemoteInput::Mouse(input) => sender.send_mouse(sequences.next_mouse(), input),
         RemoteInput::Keyboard(input) => sender.send_keyboard(sequences.next_keyboard(), input),
+        RemoteInput::ReleaseCenterSnap => sender.send_control(sequences.next_control(), true),
     }
 }
 
-pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) {
+fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool) {
+    let mut reply = [0u8; 32];
+    loop {
+        match sender.socket.recv(&mut reply) {
+            Ok(8)
+                if &reply[..4] == CONTROL_MAGIC
+                    && reply[4] == HID_UDP_VERSION
+                    && u16::from_le_bytes([reply[6], reply[7]]) == HID_UDP_DEVICE_ID =>
+            {
+                center_snap.store(reply[5] & 1 != 0, Ordering::Release);
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
+            Err(_) => return,
+        }
+    }
+}
+
+pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Arc<AtomicBool> {
+    let center_snap = Arc::new(AtomicBool::new(false));
+    let sender_center_snap = Arc::clone(&center_snap);
     thread::spawn(move || {
         let mut sequences = HidUdpSeqs::new();
         let mut sender = None;
         let mut active_host = String::new();
         let mut last_attempt = None;
+        let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
         loop {
             let current_host = target.host();
             if current_host != active_host {
@@ -170,6 +245,7 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) {
                 match target.resolve(100) {
                     Ok(target_addr) => match HidUdpSender::connect(target_addr) {
                         Ok(connected) => {
+                            let _ = connected.socket.set_nonblocking(true);
                             eprintln!(
                                 "trueos-rdp: UDP HID target={} device={}",
                                 target_addr, HID_UDP_DEVICE_ID
@@ -197,6 +273,21 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) {
                 }
             }
 
+
+            if let Some(connected) = sender.as_ref() {
+                receive_control(connected, &sender_center_snap);
+                if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
+                    last_control_poll = Instant::now();
+                    if connected
+                        .send_control(sequences.next_control(), false)
+                        .is_err()
+                    {
+                        sender = None;
+                        sender_center_snap.store(false, Ordering::Release);
+                    }
+                }
+            }
+
             match input_rx.recv_timeout(READ_TIMEOUT) {
                 Ok(input) => {
                     if let Some(connected) = sender.as_ref()
@@ -211,6 +302,7 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) {
             }
         }
     });
+    center_snap
 }
 
 #[cfg(test)]
