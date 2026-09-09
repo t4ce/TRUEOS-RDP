@@ -65,6 +65,10 @@ mod tests {
         let mut motion = CaptureMotion::default();
         motion.position(10.0, 20.0);
         motion.set_enabled(true);
+        // GNOME absolute valuators also arrive under winit's MouseMotion name.
+        // They must not be sent as enormous deltas or switch the capture source.
+        assert_eq!(motion.raw(945.0, 660.0), None);
+        assert!(!motion.uses_raw());
         assert_eq!(motion.position(900.0, 600.0), None);
         assert_eq!(motion.position(910.0, 590.0), Some((10.0, -10.0)));
         assert_eq!(motion.position(915.0, 580.0), Some((5.0, -10.0)));
