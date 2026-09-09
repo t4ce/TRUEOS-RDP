@@ -11,7 +11,9 @@ microfont = "3.7.8"
 winit = "0.30.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
+raw-window-handle = "0.6.2"
 wgpu = { version = "30.0", default-features = false, features = ["vulkan", "wgsl"] }
+x11rb = "0.13.2"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 wgpu = { version = "30.0", default-features = false, features = ["metal", "wgsl"] }
