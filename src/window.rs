@@ -155,6 +155,7 @@ pub struct WgpuWindowApp<P> {
 struct LinuxPointerPoller {
     connection: RustConnection,
     window: u32,
+    emitted: u64,
 }
 
 #[cfg(target_os = "linux")]
@@ -166,10 +167,15 @@ impl LinuxPointerPoller {
             _ => return None,
         };
         let (connection, _) = x11rb::connect(None).ok()?;
-        Some(Self { connection, window })
+        eprintln!("trueos-rdp: pseudo-snap attached x11-window=0x{window:x}");
+        Some(Self {
+            connection,
+            window,
+            emitted: 0,
+        })
     }
 
-    fn take_center_delta(&self, width: u32, height: u32) -> Option<(f64, f64)> {
+    fn take_center_delta(&mut self, width: u32, height: u32) -> Option<(f64, f64)> {
         let pointer = self
             .connection
             .query_pointer(self.window)
@@ -187,6 +193,13 @@ impl LinuxPointerPoller {
             .warp_pointer(x11rb::NONE, self.window, 0, 0, 0, 0, center_x, center_y)
             .ok()?;
         self.connection.flush().ok()?;
+        self.emitted = self.emitted.saturating_add(1);
+        if self.emitted <= 8 || self.emitted.is_power_of_two() {
+            eprintln!(
+                "trueos-rdp: pseudo-snap delta=({dx},{dy}) count={}",
+                self.emitted
+            );
+        }
         Some((f64::from(dx), f64::from(dy)))
     }
 }
@@ -855,6 +868,9 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         #[cfg(target_os = "linux")]
         {
             self.pointer_poller = LinuxPointerPoller::new(&window);
+            if self.pointer_poller.is_none() {
+                eprintln!("trueos-rdp: pseudo-snap unavailable: no X11 pointer surface");
+            }
         }
         let delta = self.producer.cursor_delta_mode();
         sync_cursor_mode(&window, &self.producer, delta);
@@ -977,7 +993,8 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         #[cfg(target_os = "linux")]
         if self.producer.cursor_delta_mode()
-            && let (Some(window), Some(poller)) = (&self.window, &self.pointer_poller)
+            && self.applied_cursor_delta_mode == Some(true)
+            && let (Some(window), Some(poller)) = (&self.window, &mut self.pointer_poller)
         {
             let size = window.inner_size();
             if let Some((dx, dy)) = poller.take_center_delta(size.width, size.height) {
