@@ -1722,10 +1722,8 @@ dependencies = [
  "bytemuck",
  "futures",
  "microfont",
- "raw-window-handle",
  "wgpu",
  "winit",
- "x11rb",
 ]
 
 [[package]]

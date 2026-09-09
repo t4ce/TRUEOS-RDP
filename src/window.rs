@@ -2,8 +2,6 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-#[cfg(not(target_os = "linux"))]
-use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
 use winit::event::{
@@ -12,13 +10,6 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, KeyCode, NamedKey, PhysicalKey};
 use winit::window::{CursorGrabMode, Window, WindowAttributes, WindowId};
-
-#[cfg(target_os = "linux")]
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-#[cfg(target_os = "linux")]
-use x11rb::{
-    connection::Connection, protocol::xproto::ConnectionExt, rust_connection::RustConnection,
-};
 
 use crate::api::{Adapter, AdapterConfig};
 use crate::renderer::{RenderError, WgpuRenderer};
@@ -35,6 +26,10 @@ pub trait FrameProducer {
 
     fn cursor_delta_mode(&self) -> bool {
         false
+    }
+
+    fn cursor_raw_capture(&self) -> bool {
+        true
     }
 
     fn window_decorations(&self) -> bool {
@@ -144,64 +139,8 @@ pub struct WgpuWindowApp<P> {
     window: Option<Arc<Window>>,
     renderer: Option<WgpuRenderer>,
     last_error: Option<RenderError>,
-    #[cfg(not(target_os = "linux"))]
-    last_raw_mouse_motion: Option<Instant>,
-    applied_cursor_delta_mode: Option<bool>,
-    #[cfg(target_os = "linux")]
-    pointer_poller: Option<LinuxPointerPoller>,
-}
-
-#[cfg(target_os = "linux")]
-struct LinuxPointerPoller {
-    connection: RustConnection,
-    window: u32,
-    emitted: u64,
-}
-
-#[cfg(target_os = "linux")]
-impl LinuxPointerPoller {
-    fn new(window: &Window) -> Option<Self> {
-        let window = match window.window_handle().ok()?.as_raw() {
-            RawWindowHandle::Xlib(handle) => handle.window as u32,
-            RawWindowHandle::Xcb(handle) => handle.window.get(),
-            _ => return None,
-        };
-        let (connection, _) = x11rb::connect(None).ok()?;
-        eprintln!("trueos-rdp: pseudo-snap attached x11-window=0x{window:x}");
-        Some(Self {
-            connection,
-            window,
-            emitted: 0,
-        })
-    }
-
-    fn take_center_delta(&mut self, width: u32, height: u32) -> Option<(f64, f64)> {
-        let pointer = self
-            .connection
-            .query_pointer(self.window)
-            .ok()?
-            .reply()
-            .ok()?;
-        let center_x = (width / 2) as i16;
-        let center_y = (height / 2) as i16;
-        let dx = pointer.win_x.saturating_sub(center_x);
-        let dy = pointer.win_y.saturating_sub(center_y);
-        if dx == 0 && dy == 0 {
-            return None;
-        }
-        self.connection
-            .warp_pointer(x11rb::NONE, self.window, 0, 0, 0, 0, center_x, center_y)
-            .ok()?;
-        self.connection.flush().ok()?;
-        self.emitted = self.emitted.saturating_add(1);
-        if self.emitted <= 8 || self.emitted.is_power_of_two() {
-            eprintln!(
-                "trueos-rdp: pseudo-snap delta=({dx},{dy}) count={}",
-                self.emitted
-            );
-        }
-        Some((f64::from(dx), f64::from(dy)))
-    }
+    cursor_mode: Option<bool>,
+    input_stats: InputStats,
 }
 
 fn new_event_loop() -> Result<EventLoop<()>, winit::error::EventLoopError> {
@@ -422,11 +361,8 @@ impl<P> WgpuWindowApp<P> {
             window: None,
             renderer: None,
             last_error: None,
-            #[cfg(not(target_os = "linux"))]
-            last_raw_mouse_motion: None,
-            applied_cursor_delta_mode: None,
-            #[cfg(target_os = "linux")]
-            pointer_poller: None,
+            cursor_mode: None,
+            input_stats: InputStats::default(),
         }
     }
 
@@ -865,16 +801,8 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         };
         let window = Arc::new(window);
-        #[cfg(target_os = "linux")]
-        {
-            self.pointer_poller = LinuxPointerPoller::new(&window);
-            if self.pointer_poller.is_none() {
-                eprintln!("trueos-rdp: pseudo-snap unavailable: no X11 pointer surface");
-            }
-        }
-        let delta = self.producer.cursor_delta_mode();
-        sync_cursor_mode(&window, &self.producer, delta);
-        self.applied_cursor_delta_mode = Some(delta);
+        sync_cursor_mode(&window, &self.producer);
+        self.cursor_mode = Some(self.producer.cursor_delta_mode());
         match WgpuRenderer::new(window.clone()) {
             Ok(renderer) => {
                 self.renderer = Some(renderer);
@@ -898,29 +826,14 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
             return;
         }
 
-        let delta_cursor_event =
-            self.producer.cursor_delta_mode() && matches!(event, WindowEvent::CursorMoved { .. });
-        if delta_cursor_event {
-            #[cfg(not(target_os = "linux"))]
-            if let WindowEvent::CursorMoved { position, .. } = &event
-                && self
-                    .last_raw_mouse_motion
-                    .is_none_or(|last| last.elapsed() >= Duration::from_millis(100))
-                && let Some(window) = &self.window
-            {
-                let size = window.inner_size();
-                let center_x = f64::from(size.width) * 0.5;
-                let center_y = f64::from(size.height) * 0.5;
-                let dx = position.x - center_x;
-                let dy = position.y - center_y;
-                if dx.abs() > 0.25 || dy.abs() > 0.25 {
-                    self.producer
-                        .handle_input(InputEvent::MouseMotionDelta { dx, dy });
-                }
-                let _ = window
-                    .set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
+        match &event {
+            WindowEvent::CursorMoved { .. } => self.input_stats.cursor += 1,
+            WindowEvent::Focused(focused) => {
+                crate::input_log::write(format_args!("window focused={focused}"))
             }
-        } else if let Some(input) = input_event(&event) {
+            _ => {}
+        }
+        if let Some(input) = input_event(&event) {
             self.producer.handle_input(input);
         }
         if let Some(input) = keyboard_input_event(&event) {
@@ -960,13 +873,11 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
                 }
                 if let Some(window) = &self.window {
                     let delta = self.producer.cursor_delta_mode();
-                    let entering_delta = self.applied_cursor_delta_mode != Some(delta) && delta;
-                    #[cfg(not(target_os = "linux"))]
-                    if self.applied_cursor_delta_mode != Some(delta) {
-                        self.last_raw_mouse_motion = None;
+                    if self.cursor_mode != Some(delta) {
+                        sync_cursor_mode(window, &self.producer);
+                        self.cursor_mode = Some(delta);
                     }
-                    sync_cursor_mode(window, &self.producer, entering_delta);
-                    self.applied_cursor_delta_mode = Some(delta);
+                    window.set_cursor_visible(!delta && self.producer.cursor_visible());
                 }
             }
             _ => {}
@@ -977,55 +888,74 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
         &mut self,
         _event_loop: &ActiveEventLoop,
         _device_id: DeviceId,
-        _event: DeviceEvent,
+        event: DeviceEvent,
     ) {
-        #[cfg(not(target_os = "linux"))]
-        if self.producer.cursor_delta_mode()
-            && let DeviceEvent::MouseMotion { delta: (dx, dy) } = _event
-            && (dx != 0.0 || dy != 0.0)
-        {
-            self.last_raw_mouse_motion = Some(Instant::now());
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            self.input_stats.raw += 1;
+            if dx != 0.0 || dy != 0.0 {
+                self.input_stats.raw_nonzero += 1;
+            }
             self.producer
                 .handle_input(InputEvent::MouseMotionDelta { dx, dy });
         }
     }
 
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
-        #[cfg(target_os = "linux")]
-        if self.producer.cursor_delta_mode()
-            && self.applied_cursor_delta_mode == Some(true)
-            && let (Some(window), Some(poller)) = (&self.window, &mut self.pointer_poller)
-        {
-            let size = window.inner_size();
-            if let Some((dx, dy)) = poller.take_center_delta(size.width, size.height) {
-                self.producer
-                    .handle_input(InputEvent::MouseMotionDelta { dx, dy });
-            }
-        }
+        self.input_stats.report(self.producer.cursor_delta_mode());
         if let Some(window) = &self.window {
             window.request_redraw();
         }
     }
 }
 
-fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P, entering_delta: bool) {
-    let delta = producer.cursor_delta_mode();
-    if delta {
-        // GNOME Remote Desktop injects an absolute compositor pointer. An
-        // X11/Wayland grab may report success while suppressing that injected
-        // motion, so snapped mode must remain a software capture. Physical
-        // mice still arrive through DeviceEvent::MouseMotion; nested RDP
-        // pointers arrive through CursorMoved and are converted to deltas.
-        let _ = window.set_cursor_grab(CursorGrabMode::None);
-        if entering_delta {
-            let size = window.inner_size();
-            let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
-                f64::from(size.width) * 0.5,
-                f64::from(size.height) * 0.5,
+struct InputStats {
+    raw: u64,
+    raw_nonzero: u64,
+    cursor: u64,
+    last_report: std::time::Instant,
+}
+
+impl Default for InputStats {
+    fn default() -> Self {
+        Self {
+            raw: 0,
+            raw_nonzero: 0,
+            cursor: 0,
+            last_report: std::time::Instant::now(),
+        }
+    }
+}
+
+impl InputStats {
+    fn report(&mut self, capture: bool) {
+        if self.last_report.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        if capture || self.raw != 0 || self.cursor != 0 {
+            crate::input_log::write(format_args!(
+                "input capture={capture} raw={} raw_nonzero={} cursor={}",
+                self.raw, self.raw_nonzero, self.cursor
             ));
         }
+        self.raw = 0;
+        self.raw_nonzero = 0;
+        self.cursor = 0;
+        self.last_report = std::time::Instant::now();
+    }
+}
+
+fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P) {
+    let delta = producer.cursor_delta_mode();
+    if delta && producer.cursor_raw_capture() {
+        let result = window
+            .set_cursor_grab(CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        crate::input_log::write(format_args!("cursor grab: {result:?}"));
     } else {
-        let _ = window.set_cursor_grab(CursorGrabMode::None);
+        let result = window.set_cursor_grab(CursorGrabMode::None);
+        crate::input_log::write(format_args!(
+            "cursor ungrab: {result:?}; visual center-snap={delta}"
+        ));
     }
     window.set_cursor_visible(!delta && producer.cursor_visible());
 }

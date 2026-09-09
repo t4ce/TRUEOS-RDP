@@ -1,4 +1,6 @@
+mod capture;
 mod input;
+mod input_log;
 mod media;
 mod target;
 mod telemetry;
@@ -46,6 +48,7 @@ const CURSOR_TRAIL_MAX_SAMPLES: usize = 48;
 struct AppConfig {
     host: String,
     no_view: bool,
+    raw_capture: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -81,6 +84,7 @@ struct Viewer {
     center_snap: Arc<AtomicBool>,
     local_delta_mode: Option<bool>,
     suppress_space_release: bool,
+    capture_motion: capture::CaptureMotion,
 }
 
 impl Viewer {
@@ -119,6 +123,7 @@ impl Viewer {
             center_snap,
             local_delta_mode: None,
             suppress_space_release: false,
+            capture_motion: capture::CaptureMotion::default(),
         }
     }
 
@@ -166,6 +171,14 @@ impl Viewer {
                 dy,
                 wheel,
             }));
+    }
+
+    fn emit_motion(&self, dx: f64, dy: f64) {
+        let dx = dx.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        let dy = dy.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16;
+        if dx != 0 || dy != 0 {
+            self.emit_mouse(dx, dy, 0);
+        }
     }
 
     fn delta_mode(&self) -> bool {
@@ -380,6 +393,10 @@ impl FrameProducer for Viewer {
         self.delta_mode()
     }
 
+    fn cursor_raw_capture(&self) -> bool {
+        self.capture_motion.uses_raw()
+    }
+
     fn window_resizable(&self) -> bool {
         true
     }
@@ -396,20 +413,26 @@ impl FrameProducer for Viewer {
             ..
         } = &event
         {
+            if self.suppress_space_release {
+                if *state == InputButtonState::Released {
+                    self.suppress_space_release = false;
+                }
+                return;
+            }
             if *state == InputButtonState::Pressed && self.keyboard_modifiers & 0x11 != 0 {
                 let enabled = !self.delta_mode();
                 self.local_delta_mode = Some(enabled);
                 self.suppress_space_release = true;
+                self.capture_motion.set_enabled(enabled);
+                input_log::write(format_args!(
+                    "Ctrl+Space consumed locally; capture={enabled}"
+                ));
                 let _ = self
                     .input_tx
                     .send(RemoteInput::SetPointerMode { relative: enabled });
                 if !enabled {
                     self.center_snap.store(false, Ordering::Release);
                 }
-                return;
-            }
-            if *state == InputButtonState::Released && self.suppress_space_release {
-                self.suppress_space_release = false;
                 return;
             }
         }
@@ -470,16 +493,19 @@ impl FrameProducer for Viewer {
             return;
         }
 
+        self.capture_motion.set_enabled(self.delta_mode());
         match event {
-            InputEvent::MouseMotionDelta { dx, dy } if self.delta_mode() => {
-                self.emit_mouse(
-                    dx.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16,
-                    dy.round().clamp(i16::MIN as f64, i16::MAX as f64) as i16,
-                    0,
-                );
+            InputEvent::MouseMotionDelta { dx, dy } => {
+                if let Some((dx, dy)) = self.capture_motion.raw(dx, dy) {
+                    self.emit_motion(dx, dy);
+                }
             }
+            InputEvent::CursorLeft => self.capture_motion.reset_position(),
             InputEvent::CursorMoved { x, y } => {
                 if self.delta_mode() {
+                    if let Some((dx, dy)) = self.capture_motion.position(x as f64, y as f64) {
+                        self.emit_motion(dx, dy);
+                    }
                     return;
                 }
                 self.update_cursor_position(x, y, true);
@@ -532,6 +558,17 @@ impl FrameProducer for Viewer {
         let _ = adapter.begin_frame(0x000000);
         if !self.no_view {
             self.draw_startup(adapter);
+        }
+        if self.delta_mode() {
+            let bytes = local_cursor_vertices(
+                self.window_width,
+                self.window_height,
+                self.window_width as f32 * 0.5,
+                self.window_height as f32 * 0.5,
+                &[],
+                Instant::now(),
+            );
+            let _ = adapter.draw_solid_batch_no_present(&bytes);
         }
         let _ = adapter.end_frame();
     }
@@ -1249,9 +1286,14 @@ fn mouse_button_bit(button: InputMouseButton) -> u32 {
 fn parse_args() -> Result<Option<AppConfig>, String> {
     let mut host = None;
     let mut no_view = false;
+    let mut raw_capture = false;
     for arg in env::args().skip(1) {
         if arg == "-h" || arg == "--help" {
             return Ok(None);
+        }
+        if arg == "--raw-capture" {
+            raw_capture = true;
+            continue;
         }
         if arg.eq_ignore_ascii_case("-NoView")
             || arg.eq_ignore_ascii_case("--NoView")
@@ -1267,15 +1309,18 @@ fn parse_args() -> Result<Option<AppConfig>, String> {
     Ok(Some(AppConfig {
         host: host.unwrap_or_else(|| DEFAULT_HOST.to_string()),
         no_view,
+        raw_capture,
     }))
 }
 
 fn usage() {
     eprintln!(
         "TRUEOS Remote Desktop\n\n\
-         Usage: trueos-rdp [HOST|HOST:PORT] [--no-view]\n\n\
+         Usage: trueos-rdp [HOST|HOST:PORT] [--no-view] [--raw-capture]\n\n\
          HOST defaults to {DEFAULT_HOST}. Input always uses UDP port {INPUT_PORT}; \
-         video uses UDP port {MEDIA_PORT}. --no-view preserves input-only mode."
+         video uses UDP port {MEDIA_PORT}. --no-view preserves input-only mode.\n\n\
+         Ctrl+Space toggles local center-snap. Default capture uses cursor positions for nested RDP. \
+         --raw-capture enables compositor grab and raw deltas for a physical mouse."
     );
 }
 
@@ -1305,7 +1350,7 @@ fn run(config: AppConfig) -> Result<(), String> {
         }
     );
 
-    let viewer = Viewer::new(
+    let mut viewer = Viewer::new(
         media,
         input_tx,
         target,
@@ -1313,6 +1358,7 @@ fn run(config: AppConfig) -> Result<(), String> {
         config.no_view,
         center_snap,
     );
+    viewer.capture_motion = capture::CaptureMotion::new(config.raw_capture);
     let app = WgpuWindowApp::new(
         format!("TRUEOS Remote Desktop — {}", config.host),
         AdapterConfig {
@@ -1325,6 +1371,11 @@ fn run(config: AppConfig) -> Result<(), String> {
 }
 
 fn main() {
+    input_log::write(format_args!(
+        "client started build={} backend={} state-log=input.log",
+        env!("CARGO_PKG_VERSION"),
+        std::env::var("TACTICS_WINIT_BACKEND").unwrap_or_else(|_| "x11".into())
+    ));
     let config = match parse_args() {
         Ok(Some(config)) => config,
         Ok(None) => {
@@ -1406,6 +1457,55 @@ mod tests {
             Ok(RemoteInput::SetPointerMode { relative: false })
         ));
         viewer.handle_input(release);
+    }
+
+    #[test]
+    fn captured_absolute_movement_sends_packets_and_repeat_does_not_leak_space() {
+        let (tx, rx) = mpsc::channel();
+        let mut viewer = Viewer::new(
+            None,
+            tx,
+            RemoteTarget::new(DEFAULT_HOST),
+            DEFAULT_HOST.to_string(),
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let key = |hid_keycode, state| InputEvent::KeyboardInput {
+            hid_keycode,
+            codepoint: 0,
+            modifiers: 0,
+            state,
+        };
+        viewer.handle_input(key(0xE0, InputButtonState::Pressed));
+        viewer.handle_input(key(0x2C, InputButtonState::Pressed));
+        viewer.handle_input(key(0x2C, InputButtonState::Pressed)); // OS repeat
+        viewer.handle_input(key(0xE0, InputButtonState::Released));
+        viewer.handle_input(key(0x2C, InputButtonState::Pressed)); // repeat after Ctrl up
+        viewer.handle_input(key(0x2C, InputButtonState::Released));
+        assert!(viewer.delta_mode());
+        viewer.handle_input(InputEvent::CursorMoved { x: 700.0, y: 400.0 });
+        viewer.handle_input(InputEvent::CursorMoved { x: 711.0, y: 396.0 });
+        viewer.handle_input(InputEvent::CursorMoved { x: 720.0, y: 390.0 });
+        let packets: Vec<_> = rx.try_iter().collect();
+        assert_eq!(
+            packets
+                .iter()
+                .filter(|p| matches!(p, RemoteInput::SetPointerMode { .. }))
+                .count(),
+            1
+        );
+        let deltas: Vec<_> = packets
+            .iter()
+            .filter_map(|p| match p {
+                RemoteInput::TabletDelta(d) => Some((d.dx, d.dy)),
+                RemoteInput::Keyboard(k) => {
+                    assert!(!k.keys.contains(&0x2C));
+                    None
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(deltas, [(11, -4), (9, -6)]);
     }
 
     #[test]

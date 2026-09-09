@@ -243,6 +243,7 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
         let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
         let mut release_pending = false;
         let mut local_pointer_mode = None;
+        let mut delta_packets = 0u64;
         loop {
             let current_host = target.host();
             if current_host != active_host {
@@ -315,17 +316,41 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
                     if let Some(relative) = pointer_mode {
                         local_pointer_mode = Some(relative);
                     }
-                    if let Some(connected) = sender.as_ref()
-                        && let Err(error) = send_input(connected, &mut sequences, input)
-                    {
-                        eprintln!("trueos-rdp: UDP HID send failed: {error}");
-                        sender = None;
-                        sender_center_snap.store(false, Ordering::Release);
-                    } else if let Some(relative) = pointer_mode {
-                        release_pending = !relative;
-                        if !relative {
-                            sender_center_snap.store(false, Ordering::Release);
+                    if let Some(connected) = sender.as_ref() {
+                        match send_input(connected, &mut sequences, input) {
+                            Ok(()) => {
+                                if let RemoteInput::TabletDelta(delta) = input {
+                                    delta_packets += 1;
+                                    if delta_packets <= 5 || delta_packets % 100 == 0 {
+                                        crate::input_log::write(format_args!(
+                                            "UDP sent tablet-delta packets={delta_packets} seq={} dx={} dy={} target={}",
+                                            sequences.tablet, delta.dx, delta.dy, connected.target
+                                        ));
+                                    }
+                                }
+                                if let Some(relative) = pointer_mode {
+                                    crate::input_log::write(format_args!(
+                                        "UDP sent pointer-mode relative={relative} target={}",
+                                        connected.target
+                                    ));
+                                    release_pending = !relative;
+                                    if !relative {
+                                        sender_center_snap.store(false, Ordering::Release);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                crate::input_log::write(format_args!(
+                                    "UDP HID send failed: {error}"
+                                ));
+                                sender = None;
+                                sender_center_snap.store(false, Ordering::Release);
+                            }
                         }
+                    } else {
+                        crate::input_log::write(format_args!(
+                            "UDP input dropped: no resolved target"
+                        ));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -339,6 +364,46 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_movement_reaches_a_real_udp_receiver() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let sender = HidUdpSender::connect(receiver.local_addr().unwrap()).unwrap();
+        let mut seqs = HidUdpSeqs::new();
+        for (dx, dy) in [(11, -4), (9, -6)] {
+            send_input(
+                &sender,
+                &mut seqs,
+                RemoteInput::TabletDelta(TabletDeltaInput {
+                    buttons_down: 0,
+                    dx,
+                    dy,
+                    wheel: 0,
+                }),
+            )
+            .unwrap();
+            let mut bytes = [0; 64];
+            let count = receiver.recv(&mut bytes).unwrap();
+            assert_eq!(count, 32);
+            assert_eq!(&bytes[..4], b"THID");
+            assert_eq!(bytes[5], HID_UDP_KIND_TABLET);
+            assert_eq!(
+                u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
+                INPUT_FLAG_RELATIVE
+            );
+            assert_eq!(
+                i32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+                i32::from(dx)
+            );
+            assert_eq!(
+                i32::from_le_bytes(bytes[20..24].try_into().unwrap()),
+                i32::from(dy)
+            );
+        }
+    }
 
     #[test]
     fn tablet_payload_is_sixteen_bytes() {
