@@ -1338,8 +1338,8 @@ fn run(config: AppConfig) -> Result<(), String> {
         )
     };
 
-    eprintln!(
-        "trueos-rdp: host={} input=udp/{} media=udp/{} mode={}",
+    input_log::write(format_args!(
+        "host={} input=udp/{} media=udp/{} mode={}",
         config.host,
         INPUT_PORT,
         MEDIA_PORT,
@@ -1348,7 +1348,7 @@ fn run(config: AppConfig) -> Result<(), String> {
         } else {
             "video+input"
         }
-    );
+    ));
 
     let mut viewer = Viewer::new(
         media,

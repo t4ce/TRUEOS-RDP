@@ -6,7 +6,7 @@ use std::sync::{
     mpsc::{Receiver, RecvTimeoutError},
 };
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use crate::target::RemoteTarget;
 
@@ -69,14 +69,10 @@ struct HidUdpSeqs {
 
 impl HidUdpSeqs {
     fn new() -> Self {
-        let start = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u32)
-            .unwrap_or(1);
         Self {
-            keyboard: start,
-            tablet: start,
-            control: start,
+            keyboard: 0,
+            tablet: 0,
+            control: 0,
         }
     }
 
@@ -208,15 +204,22 @@ fn pointer_mode_control_flags(relative: bool) -> u16 {
         }
 }
 
-fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool, release_pending: &mut bool) {
+fn receive_control(
+    sender: &HidUdpSender,
+    center_snap: &AtomicBool,
+    release_pending: &mut bool,
+) -> bool {
+    let mut received = false;
     let mut reply = [0u8; 32];
     loop {
-        match sender.socket.recv(&mut reply) {
-            Ok(8)
-                if &reply[..4] == CONTROL_MAGIC
+        match sender.socket.recv_from(&mut reply) {
+            Ok((8, peer))
+                if peer == sender.target
+                    && &reply[..4] == CONTROL_MAGIC
                     && reply[4] == HID_UDP_VERSION
                     && u16::from_le_bytes([reply[6], reply[7]]) == HID_UDP_DEVICE_ID =>
             {
+                received = true;
                 let enabled = reply[5] & 1 != 0;
                 if !enabled {
                     *release_pending = false;
@@ -226,8 +229,8 @@ fn receive_control(sender: &HidUdpSender, center_snap: &AtomicBool, release_pend
                 }
             }
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return,
-            Err(_) => return,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return received,
+            Err(_) => return received,
         }
     }
 }
@@ -244,6 +247,8 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
         let mut release_pending = false;
         let mut local_pointer_mode = None;
         let mut delta_packets = 0u64;
+        let mut last_reply = None;
+        let mut receiver_responding = None;
         loop {
             let current_host = target.host();
             if current_host != active_host {
@@ -262,11 +267,14 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
                 match target.resolve(100) {
                     Ok(target_addr) => match HidUdpSender::connect(target_addr) {
                         Ok(connected) => {
+                            sequences = HidUdpSeqs::new();
+                            last_reply = None;
+                            receiver_responding = None;
                             let _ = connected.socket.set_nonblocking(true);
-                            eprintln!(
-                                "trueos-rdp: UDP HID target={} device={}",
+                            crate::input_log::write(format_args!(
+                                "UDP HID target={} device={} counter=per-process",
                                 target_addr, HID_UDP_DEVICE_ID
-                            );
+                            ));
                             let probe = RemoteInput::Tablet(TabletInput {
                                 x_q16: 32768,
                                 y_q16: 32768,
@@ -291,7 +299,18 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
             }
 
             if let Some(connected) = sender.as_ref() {
-                receive_control(connected, &sender_center_snap, &mut release_pending);
+                if receive_control(connected, &sender_center_snap, &mut release_pending) {
+                    last_reply = Some(Instant::now());
+                }
+                let responding =
+                    last_reply.is_some_and(|at: Instant| at.elapsed() < Duration::from_secs(2));
+                if receiver_responding != Some(responding) {
+                    crate::input_log::write(format_args!(
+                        "UDP HID receiver responding={responding} target={} (control reply)",
+                        connected.target
+                    ));
+                    receiver_responding = Some(responding);
+                }
                 if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
                     last_control_poll = Instant::now();
                     let flags = local_pointer_mode
@@ -364,6 +383,40 @@ pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Ar
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sender_counters_are_independent_and_restart_without_a_clock() {
+        let mut first = HidUdpSeqs::new();
+        assert_eq!(first.next_tablet(), 1);
+        assert_eq!(first.next_tablet(), 2);
+        assert_eq!(first.next_keyboard(), 1);
+        assert_eq!(first.next_control(), 1);
+        let mut restarted = HidUdpSeqs::new();
+        assert_eq!(restarted.next_tablet(), 1);
+    }
+
+    #[test]
+    fn receiver_status_requires_a_reply_from_the_target() {
+        let target = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let sender = HidUdpSender::connect(target.local_addr().unwrap()).unwrap();
+        sender.socket.set_nonblocking(true).unwrap();
+        let snap = AtomicBool::new(false);
+        let mut pending = false;
+        assert!(!receive_control(&sender, &snap, &mut pending));
+        let mut reply = [0u8; 8];
+        reply[..4].copy_from_slice(CONTROL_MAGIC);
+        reply[4] = HID_UDP_VERSION;
+        reply[5] = 1;
+        reply[6..8].copy_from_slice(&HID_UDP_DEVICE_ID.to_le_bytes());
+        let dest = SocketAddr::from(([127, 0, 0, 1], sender.socket.local_addr().unwrap().port()));
+        target.send_to(&reply, dest).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !receive_control(&sender, &snap, &mut pending) {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+        assert!(snap.load(Ordering::Acquire));
+    }
 
     #[test]
     fn captured_movement_reaches_a_real_udp_receiver() {
