@@ -905,6 +905,7 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
     ) {
         if self.producer.cursor_delta_mode()
             && let DeviceEvent::MouseMotion { delta: (dx, dy) } = event
+            && (dx != 0.0 || dy != 0.0)
         {
             self.last_raw_mouse_motion = Some(Instant::now());
             self.producer
@@ -922,9 +923,12 @@ impl<P: FrameProducer> ApplicationHandler for WgpuWindowApp<P> {
 fn sync_cursor_mode<P: FrameProducer>(window: &Window, producer: &P, entering_delta: bool) {
     let delta = producer.cursor_delta_mode();
     if delta {
-        let _ = window
-            .set_cursor_grab(CursorGrabMode::Locked)
-            .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+        // GNOME Remote Desktop injects an absolute compositor pointer. An
+        // X11/Wayland grab may report success while suppressing that injected
+        // motion, so snapped mode must remain a software capture. Physical
+        // mice still arrive through DeviceEvent::MouseMotion; nested RDP
+        // pointers arrive through CursorMoved and are converted to deltas.
+        let _ = window.set_cursor_grab(CursorGrabMode::None);
         if entering_delta {
             let size = window.inner_size();
             let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(
