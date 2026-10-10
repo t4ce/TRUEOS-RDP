@@ -2,7 +2,7 @@
 
 ## Baseline
 
-The client has five independent paths:
+The client has six independent paths:
 
 1. **Input data plane** — the existing THID packets go to UDP port 100. Their
    magic, version, device ID, sequence handling, keyboard report, tablet
@@ -32,6 +32,42 @@ The client has five independent paths:
    and disables the panel for the remainder of the process. `ping` is a
    best-effort mean UDP arrival interval: TME1 has no echo or sender timestamp
    from which a real round-trip time could be calculated.
+6. **Drop uploads** — native winit file-drop events collect into one job per
+   drop (a 200 ms quiet period ends the event burst). Each job captures the
+   selected host, so editing the connection target cannot redirect queued
+   files. Up to eight active, queued, and failed jobs are retained in memory.
+   One background worker at a time packs the selected files and folders into
+   a standard tar archive and streams it through LZ4 frame compression into
+   an anonymous temporary file. This keeps client memory bounded and provides
+   the Content-Length required by the current TRUEOSFS HTTP receiver.
+
+   The worker discovers raw root IDs from GET / and uses the first advertised
+   (primary) mount. POST /mkdir/<root>?name=RdpUpload creates the inbox;
+   POST /up/<root>/RdpUpload?name=<archive>&content=blob stores the compressed
+   bytes without inference or decompression. No kernel change is required.
+   Timestamp, process ID, and sequence suffixes distinguish archive names;
+   duplicate top-level item names inside a drop receive numeric suffixes.
+   Folder hierarchy and empty directories are preserved. Symlinks are archived
+   as links and never followed; unsupported devices/pipes fail the job.
+
+   The existing 2x microfont draws packing/upload progress at bottom left in
+   both the startup and connected render paths. Completion/errors disappear
+   after six seconds; the idle window has no upload label. A failure does not
+   stop subsequent jobs. F8 retries retained failures on their original hosts
+   (repacking the original paths); it is consumed locally only when retrying.
+   The queue is session-local. Temporary archives are removed after each
+   attempt. The client enforces the service's 2 GiB compressed-upload limit,
+   and reports success only after a complete successful HTTP response.
+
+   Linux uses the existing default X11/XWayland window backend for native
+   drops; this winit release does not implement drop events in its opt-in
+   native Wayland backend. Windows and macOS use their native drop events.
+
+   Validation: `cargo test --offline` round-trips single files, folders, mixed
+   drops, duplicate names, empty folders, and symlinks through tar/LZ4; checks
+   queue serialization, failure continuation/retry, captured destinations and
+   notice expiry; and exercises discovery/mkdir/Blob POST against a localhost
+   mock TRUEOSFS service, including storage and truncated-response errors.
 
 There is no remote scene graph, resource snapshot, remote shader, resize
 recomposition request, or application-drawn window chrome. The connection
@@ -72,7 +108,7 @@ The TCP connection owns the lifetime of its media subscription. On disconnect,
 TRUEOS stops that subscriber. TME1 remains the UDP media wire format and THID
 remains the independent UDP input format.
 
-No TCP bytes are sent by the current client because the live kernel still
+No TCP media-control bytes are sent by the current client because the live kernel still
 exposes the old scene protocol on that port. The control protocol should be
 added to both sides together, behind a new magic/version, so an old endpoint
 cannot misinterpret it.
