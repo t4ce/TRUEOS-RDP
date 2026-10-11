@@ -97,6 +97,7 @@ pub enum InputKey {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum InputEvent {
+    DroppedFile(std::path::PathBuf),
     CursorMoved {
         x: f32,
         y: f32,
@@ -2252,6 +2253,7 @@ fn keyboard_input_event(event: &WindowEvent) -> Option<InputEvent> {
 
 fn input_event(event: &WindowEvent) -> Option<InputEvent> {
     match event {
+        WindowEvent::DroppedFile(path) => Some(InputEvent::DroppedFile(path.clone())),
         WindowEvent::CursorMoved { position, .. } => Some(InputEvent::CursorMoved {
             x: position.x as f32,
             y: position.y as f32,

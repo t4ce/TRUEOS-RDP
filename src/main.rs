@@ -4,6 +4,7 @@ mod input_log;
 mod media;
 mod target;
 mod telemetry;
+mod upload;
 
 mod api;
 mod command;
@@ -85,6 +86,8 @@ struct Viewer {
     local_delta_mode: Option<bool>,
     suppress_space_release: bool,
     capture_motion: capture::CaptureMotion,
+    uploads: upload::UploadQueue,
+    suppress_upload_retry_release: bool,
 }
 
 impl Viewer {
@@ -124,6 +127,8 @@ impl Viewer {
             local_delta_mode: None,
             suppress_space_release: false,
             capture_motion: capture::CaptureMotion::default(),
+            uploads: upload::UploadQueue::default(),
+            suppress_upload_retry_release: false,
         }
     }
 
@@ -332,6 +337,7 @@ impl Viewer {
 
 impl FrameProducer for Viewer {
     fn visual_presentation(&mut self) -> Option<VisualPresentation> {
+        self.uploads.poll(Instant::now());
         if self.no_view {
             return None;
         }
@@ -354,6 +360,24 @@ impl FrameProducer for Viewer {
         );
         let width = self.window_width.max(1) as f32;
         let height = self.window_height.max(1) as f32;
+        let mut overlay_vertices = if self.delta_mode() {
+            Vec::new()
+        } else {
+            local_cursor_vertices(
+                self.window_width,
+                self.window_height,
+                self.cursor_x,
+                self.cursor_y,
+                &self.cursor_trail,
+                Instant::now(),
+            )
+        };
+        push_upload_status(
+            &mut overlay_vertices,
+            self.window_width,
+            self.window_height,
+            &self.uploads.lines(),
+        );
         Some(VisualPresentation {
             image,
             video_bounds: [
@@ -362,18 +386,7 @@ impl FrameProducer for Viewer {
                 (rect.x + rect.width) / width * 2.0 - 1.0,
                 1.0 - (rect.y + rect.height) / height * 2.0,
             ],
-            overlay_vertices: if self.delta_mode() {
-                Vec::new()
-            } else {
-                local_cursor_vertices(
-                    self.window_width,
-                    self.window_height,
-                    self.cursor_x,
-                    self.cursor_y,
-                    &self.cursor_trail,
-                    Instant::now(),
-                )
-            },
+            overlay_vertices,
             telemetry: self.telemetry.as_ref().and_then(TelemetryHud::take_latest),
             telemetry_visible: self.telemetry.is_some(),
             telemetry_bounds: [
@@ -407,6 +420,29 @@ impl FrameProducer for Viewer {
     }
 
     fn handle_input(&mut self, event: InputEvent) {
+        if let InputEvent::DroppedFile(path) = event {
+            self.uploads
+                .dropped(path, self.target.host(), Instant::now());
+            return;
+        }
+        if let InputEvent::KeyboardInput {
+            hid_keycode: 0x41,
+            state,
+            ..
+        } = &event
+        {
+            if *state == InputButtonState::Pressed && self.uploads.has_failed() {
+                self.uploads.retry_failed(Instant::now());
+                self.suppress_upload_retry_release = true;
+                return;
+            }
+            if self.suppress_upload_retry_release {
+                if *state == InputButtonState::Released {
+                    self.suppress_upload_retry_release = false;
+                }
+                return;
+            }
+        }
         if let InputEvent::KeyboardInput {
             hid_keycode: 0x2C,
             state,
@@ -570,7 +606,78 @@ impl FrameProducer for Viewer {
             );
             let _ = adapter.draw_solid_batch_no_present(&bytes);
         }
+        let mut bytes = Vec::new();
+        push_upload_status(
+            &mut bytes,
+            self.window_width,
+            self.window_height,
+            &self.uploads.lines(),
+        );
+        if !bytes.is_empty() {
+            let _ = adapter.draw_solid_batch_no_present(&bytes);
+        }
         let _ = adapter.end_frame();
+    }
+}
+
+/// Use the same 2x microfont as the bottom-right telemetry, with a small shadow
+/// for contrast over video. There is no persistent label or panel when idle.
+fn push_upload_status(bytes: &mut Vec<u8>, width: u32, height: u32, lines: &[String]) {
+    const SCALE: usize = 2;
+    let max_chars = (width.saturating_sub(16) as usize / (microfont::FWIDTH * SCALE)).max(1);
+    let line_height = microfont::FHEIGHT * SCALE + 4;
+    let visible_lines = lines
+        .len()
+        .min(height.saturating_sub(16) as usize / line_height);
+    for (row, line) in lines.iter().take(visible_lines).enumerate() {
+        let text: String = line
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .take(max_chars)
+            .collect();
+        let bitmap_width = text.chars().count() * microfont::FWIDTH;
+        if bitmap_width == 0 {
+            continue;
+        }
+        let mut bitmap = vec![0u32; bitmap_width * microfont::FHEIGHT];
+        let _ = microfont::stamp_text(
+            &mut bitmap,
+            bitmap_width,
+            microfont::FHEIGHT,
+            0,
+            0,
+            &text,
+            0xffff_ffff,
+        );
+        let top = height.saturating_sub(8 + ((visible_lines - row) * line_height) as u32) as f32;
+        for (index, pixel) in bitmap.iter().enumerate() {
+            if *pixel == 0 {
+                continue;
+            }
+            let x = 8.0 + (index % bitmap_width * SCALE) as f32;
+            let y = top + (index / bitmap_width * SCALE) as f32;
+            push_px_rect_alpha(
+                bytes,
+                width as f32,
+                height as f32,
+                x + 1.0,
+                y + 1.0,
+                x + 3.0,
+                y + 3.0,
+                0,
+                220,
+            );
+            push_px_rect(
+                bytes,
+                width as f32,
+                height as f32,
+                x,
+                y,
+                x + 2.0,
+                y + 2.0,
+                0xffffff,
+            );
+        }
     }
 }
 
@@ -1320,7 +1427,8 @@ fn usage() {
          HOST defaults to {DEFAULT_HOST}. Input always uses UDP port {INPUT_PORT}; \
          video uses UDP port {MEDIA_PORT}. --no-view preserves input-only mode.\n\n\
          Ctrl+Space toggles local center-snap. Default capture uses cursor positions for nested RDP. \
-         --raw-capture enables compositor grab and raw deltas for a physical mouse."
+         --raw-capture enables compositor grab and raw deltas for a physical mouse.\n\
+         Drop files or folders to upload a tar.lz4 Blob to /RdpUpload. F8 retries failed drops."
     );
 }
 
@@ -1397,6 +1505,39 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_text_is_hidden_when_idle_and_draws_at_bottom_left() {
+        let mut bytes = Vec::new();
+        push_upload_status(&mut bytes, 1280, 800, &[]);
+        assert!(bytes.is_empty());
+        push_upload_status(&mut bytes, 1280, 800, &["Uploading 63% | 4.2 MiB/s".into()]);
+        assert!(!bytes.is_empty());
+        for vertex in bytes.chunks_exact(12) {
+            let x = f32::from_le_bytes(vertex[..4].try_into().unwrap());
+            let y = f32::from_le_bytes(vertex[4..8].try_into().unwrap());
+            assert!((-1.0..0.0).contains(&x));
+            assert!((-1.0..-0.8).contains(&y));
+        }
+    }
+
+    #[test]
+    fn native_drop_is_consumed_locally_before_video_and_in_input_only_mode() {
+        for no_view in [false, true] {
+            let (input_tx, input_rx) = mpsc::channel();
+            let target = RemoteTarget::new("rig");
+            let mut viewer = Viewer::new(
+                None,
+                input_tx,
+                target,
+                "rig".into(),
+                no_view,
+                Arc::new(AtomicBool::new(false)),
+            );
+            viewer.handle_input(InputEvent::DroppedFile("file.txt".into()));
+            assert!(input_rx.try_recv().is_err());
+        }
+    }
 
     #[test]
     fn letterboxes_wide_source_in_tall_window() {
