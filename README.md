@@ -42,3 +42,29 @@ five and every hundredth packet); it does not prove receipt by TRUEOS.
 
 Build and verify with `cargo test` and `cargo build --release`, then relaunch
 the RDP tool from StartCenter to load the rebuilt executable.
+
+On older Intel Haswell GPUs (for example HD Graphics 4600), Mesa may report
+Vulkan conformance version `0.0.0.0`. wgpu hides these adapters by default,
+even when `vulkaninfo` detects them. To test the viewer with such an adapter,
+build the updated executable and launch it directly from the repository:
+
+```sh
+WGPU_ALLOW_UNDERLYING_NONCOMPLIANT_ADAPTER=1 ./target/release/trueos-rdp
+```
+
+This opts into an incompletely supported driver; rendering may still fail or
+show artifacts. If startup fails, capture the terminal's
+`adapterlibgfx renderer startup error` message.
+
+The Linux build includes Vulkan and native OpenGL/GLES. Both are considered
+by default, so a GPU hidden by Vulkan can still be selected through OpenGL.
+The OpenGL path uses presentation-only limits and draws uploaded frames into
+the window rather than requiring direct swapchain texture uploads. To force
+OpenGL when diagnosing driver problems:
+
+```sh
+WGPU_BACKEND=gl ./target/release/trueos-rdp
+```
+
+The terminal's `adapterlibgfx desktop selected` line identifies the selected
+backend and GPU. OpenGL uses the system EGL/GL driver; no browser is bundled.

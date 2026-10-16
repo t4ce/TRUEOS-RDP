@@ -12,11 +12,12 @@ use crate::command::{
 };
 use crate::records::{Rgba8, SolidTriangle, SpriteTriangle};
 use crate::texture::{TextureImage, TextureRegistry};
-use crate::visual::{VisualPresentation, VisualPresenter};
+use crate::visual::{VisualImage, VisualPresentation, VisualPresenter};
 
 #[derive(Debug)]
 pub enum RenderError {
     AdapterUnavailable,
+    AdapterRequestFailed(String),
     DeviceUnavailable(String),
     Surface(String),
     MissingTexture(u32),
@@ -147,6 +148,8 @@ impl WgpuRenderer {
         let backends = desktop_backends();
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends,
+            flags: wgpu::InstanceFlags::from_env_or_default(),
+            display: Some(Box::new(window.clone())),
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
         let surface = instance
@@ -161,13 +164,19 @@ impl WgpuRenderer {
         }));
         let adapter = match adapter {
             Ok(adapter) => adapter,
-            Err(_) => return Err(RenderError::AdapterUnavailable),
+            Err(error) => return Err(RenderError::AdapterRequestFailed(error.to_string())),
         };
         let info = adapter.get_info();
+        let required_limits = if info.backend == wgpu::Backend::Gl {
+            // Presentation only needs textures and vertex buffers, not compute or storage.
+            wgpu::Limits::downlevel_webgl2_defaults().using_resolution(adapter.limits())
+        } else {
+            wgpu::Limits::default()
+        };
         let (device, queue) = match block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("adapterlibgfx-copy-device"),
             required_features: wgpu::Features::empty(),
-            required_limits: wgpu::Limits::default(),
+            required_limits,
             memory_hints: wgpu::MemoryHints::Performance,
             ..Default::default()
         })) {
@@ -204,7 +213,8 @@ impl WgpuRenderer {
             .or_else(|| caps.alpha_modes.first().copied())
             .unwrap_or(wgpu::CompositeAlphaMode::Opaque);
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | (caps.usages & wgpu::TextureUsages::COPY_DST),
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: size.width.max(1),
@@ -268,6 +278,23 @@ impl WgpuRenderer {
         )?;
         if !frame.allow_present {
             return Ok(());
+        }
+
+        // GLES swapchain textures are render targets and cannot receive direct uploads.
+        // Reuse the video presenter to draw the CPU-rendered startup/input frame.
+        if !self.config.usage.contains(wgpu::TextureUsages::COPY_DST) {
+            return self.render_visual(VisualPresentation {
+                image: Some(VisualImage {
+                    width: logical.width,
+                    height: logical.height,
+                    rgba: logical.rgba,
+                }),
+                video_bounds: [-1.0, 1.0, 1.0, -1.0],
+                overlay_vertices: Vec::new(),
+                telemetry: None,
+                telemetry_visible: false,
+                telemetry_bounds: [0.0; 4],
+            });
         }
 
         let surface_frame = match self.surface.get_current_texture() {
@@ -385,7 +412,7 @@ fn desktop_backends() -> wgpu::Backends {
         return wgpu::Backends::from_comma_list(&value);
     }
 
-    wgpu::Backends::PRIMARY
+    wgpu::Backends::PRIMARY | wgpu::Backends::GL
 }
 
 fn desktop_power_preference() -> wgpu::PowerPreference {
