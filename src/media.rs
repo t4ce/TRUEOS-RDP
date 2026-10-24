@@ -73,7 +73,7 @@ struct MediaStatus {
     decoded_frames: u64,
     dropped_datagrams: u64,
     received_datagrams: u64,
-    received_wire_bytes: u64,
+    received_ip_bytes: u64,
     decoded_at: VecDeque<Instant>,
     datagrams: VecDeque<(Instant, usize)>,
     arrival_gaps: VecDeque<Duration>,
@@ -92,9 +92,11 @@ pub struct MediaDiagnostics {
     pub sessions: u64,
     pub access_units: u64,
     pub decoded_frames: u64,
-    pub dropped_datagrams: u64,
+    /// Receiver anomalies include sequence gaps, duplicates and reassembly skips.
+    pub receive_anomalies: u64,
     pub received_datagrams: u64,
-    pub received_wire_bytes: u64,
+    /// UDP payload plus IP/UDP headers; excludes Ethernet framing.
+    pub received_ip_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -216,9 +218,9 @@ impl MediaFeed {
                 sessions: status.sessions,
                 access_units: status.access_units,
                 decoded_frames: status.decoded_frames,
-                dropped_datagrams: status.dropped_datagrams,
+                receive_anomalies: status.dropped_datagrams,
                 received_datagrams: status.received_datagrams,
-                received_wire_bytes: status.received_wire_bytes,
+                received_ip_bytes: status.received_ip_bytes,
             })
             .unwrap_or_default()
     }
@@ -234,7 +236,7 @@ impl MediaStatus {
 
     fn record_datagram(&mut self, at: Instant, bytes: usize) {
         self.received_datagrams = self.received_datagrams.saturating_add(1);
-        self.received_wire_bytes = self.received_wire_bytes.saturating_add(bytes as u64);
+        self.received_ip_bytes = self.received_ip_bytes.saturating_add(bytes as u64);
         if let Some(previous) = self.last_datagram_at {
             self.arrival_gaps.push_back(at.duration_since(previous));
             if self.arrival_gaps.len() > 100 {

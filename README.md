@@ -43,6 +43,21 @@ five and every hundredth packet); it does not prove receipt by TRUEOS.
 Build and verify with `cargo test` and `cargo build --release`, then relaunch
 the RDP tool from StartCenter to load the rebuilt executable.
 
+To measure the real UDP receiver and ffmpeg decoder without a graphical window:
+
+```sh
+cargo run --release --example media-probe -- 192.168.178.94 40
+```
+
+The probe subscribes from an ephemeral local UDP port and prints cumulative
+access units, decoded frames, datagrams, and receiver anomalies once per second.
+The rate is IP/UDP traffic in Mbps, excluding Ethernet framing. Anomalies include
+gaps, reordered or duplicate datagrams, and reassembly skips; they are not an
+exact packet-loss count. Run a single video subscriber at a time, and allow time
+for the rig's previous stream session to finish before comparing active samples.
+The viewer logs the effective receive buffer at startup; the operating system
+may clamp the 1 MiB request or include additional accounting in the reported size.
+
 On older Intel Haswell GPUs (for example HD Graphics 4600), Mesa may report
 Vulkan conformance version `0.0.0.0`. wgpu hides these adapters by default,
 even when `vulkaninfo` detects them. To test the viewer with such an adapter,

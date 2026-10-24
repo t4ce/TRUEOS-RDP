@@ -41,12 +41,12 @@ fn main() -> io::Result<()> {
         let elapsed = now.duration_since(last_sample).as_secs_f64();
         let status = feed.state();
         let totals = feed.diagnostics();
-        let wire_mbps = totals.received_wire_bytes.saturating_sub(last_bytes) as f64 * 8.0
+        let ip_mbps = totals.received_ip_bytes.saturating_sub(last_bytes) as f64 * 8.0
             / elapsed
             / 1_000_000.0;
         let decoded_fps = totals.decoded_frames.saturating_sub(last_frames) as f64 / elapsed;
         println!(
-            "elapsed_s={:.3} connected={} sessions={} au={} decoded={} fps={:.2} datagrams={} drops={} wire_mbps={:.3} error={:?}",
+            "elapsed_s={:.3} connected={} sessions={} au={} decoded={} fps={:.2} datagrams={} anomalies={} ip_mbps={:.3} error={:?}",
             started.elapsed().as_secs_f64(),
             status.connected,
             totals.sessions,
@@ -54,24 +54,24 @@ fn main() -> io::Result<()> {
             totals.decoded_frames,
             decoded_fps,
             totals.received_datagrams,
-            totals.dropped_datagrams,
-            wire_mbps,
+            totals.receive_anomalies,
+            ip_mbps,
             status.last_error
         );
         last_sample = now;
-        last_bytes = totals.received_wire_bytes;
+        last_bytes = totals.received_ip_bytes;
         last_frames = totals.decoded_frames;
     }
     let totals = feed.diagnostics();
     println!(
-        "summary elapsed_s={:.3} sessions={} au={} decoded={} datagrams={} drops={} wire_bytes={}",
+        "summary elapsed_s={:.3} sessions={} au={} decoded={} datagrams={} anomalies={} ip_bytes={}",
         started.elapsed().as_secs_f64(),
         totals.sessions,
         totals.access_units,
         totals.decoded_frames,
         totals.received_datagrams,
-        totals.dropped_datagrams,
-        totals.received_wire_bytes
+        totals.receive_anomalies,
+        totals.received_ip_bytes
     );
     Ok(())
 }
