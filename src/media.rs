@@ -26,6 +26,9 @@ const REORDER_TIMEOUT: Duration = Duration::from_millis(750);
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 const SUBSCRIBE_INTERVAL: Duration = Duration::from_millis(500);
 const SUBSCRIBE_TOKEN: &[u8; 8] = b"TME1GET1";
+// A keyframe arrives as a burst while the receiver may briefly wait for the
+// decoder pipe. Bound the socket headroom without waiting to fill it.
+const RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
 
 const FLAG_START: u8 = 1 << 0;
 const FLAG_END: u8 = 1 << 1;
@@ -47,6 +50,11 @@ impl MediaConfig {
         };
         Self { bind, target }
     }
+
+    pub fn with_bind_port(mut self, port: u16) -> Self {
+        self.bind.set_port(port);
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -64,6 +72,8 @@ struct MediaStatus {
     access_units: u64,
     decoded_frames: u64,
     dropped_datagrams: u64,
+    received_datagrams: u64,
+    received_wire_bytes: u64,
     decoded_at: VecDeque<Instant>,
     datagrams: VecDeque<(Instant, usize)>,
     arrival_gaps: VecDeque<Duration>,
@@ -75,6 +85,16 @@ struct MediaStatus {
 pub struct MediaState {
     pub connected: bool,
     pub last_error: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MediaDiagnostics {
+    pub sessions: u64,
+    pub access_units: u64,
+    pub decoded_frames: u64,
+    pub dropped_datagrams: u64,
+    pub received_datagrams: u64,
+    pub received_wire_bytes: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -95,6 +115,17 @@ pub struct MediaFeed {
 impl MediaFeed {
     pub fn spawn(config: MediaConfig) -> io::Result<Self> {
         let socket = UdpSocket::bind(config.bind)?;
+        let socket_options = socket2::SockRef::from(&socket);
+        if let Err(error) = socket_options.set_recv_buffer_size(RECEIVE_BUFFER_BYTES) {
+            eprintln!("trueos-rdp: cannot enlarge media receive buffer: {error}");
+        }
+        match socket_options.recv_buffer_size() {
+            Ok(effective) => eprintln!(
+                "trueos-rdp: media receive buffer requested={} effective={effective}",
+                RECEIVE_BUFFER_BYTES
+            ),
+            Err(error) => eprintln!("trueos-rdp: cannot query media receive buffer: {error}"),
+        }
         socket.set_read_timeout(Some(Duration::from_millis(100)))?;
 
         let mut child = Command::new("ffmpeg")
@@ -177,6 +208,20 @@ impl MediaFeed {
             .map(|status| status.metrics(now))
             .unwrap_or_default()
     }
+
+    pub fn diagnostics(&self) -> MediaDiagnostics {
+        self.status
+            .lock()
+            .map(|status| MediaDiagnostics {
+                sessions: status.sessions,
+                access_units: status.access_units,
+                decoded_frames: status.decoded_frames,
+                dropped_datagrams: status.dropped_datagrams,
+                received_datagrams: status.received_datagrams,
+                received_wire_bytes: status.received_wire_bytes,
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl MediaStatus {
@@ -188,6 +233,8 @@ impl MediaStatus {
     }
 
     fn record_datagram(&mut self, at: Instant, bytes: usize) {
+        self.received_datagrams = self.received_datagrams.saturating_add(1);
+        self.received_wire_bytes = self.received_wire_bytes.saturating_add(bytes as u64);
         if let Some(previous) = self.last_datagram_at {
             self.arrival_gaps.push_back(at.duration_since(previous));
             if self.arrival_gaps.len() > 100 {
@@ -385,15 +432,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
 }
 
 fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = 0xffff_ffffu32;
-    for &byte in bytes {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = 0u32.wrapping_sub(crc & 1);
-            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
-        }
-    }
-    !crc
+    crc32fast::hash(bytes)
 }
 
 struct AccessUnit {
@@ -865,6 +904,17 @@ mod tests {
             Packet::parse(&bytes),
             Err(PacketError::CrcMismatch)
         ));
+    }
+
+    #[test]
+    fn crc32_matches_independent_ieee_wire_vectors() {
+        assert_eq!(crc32(&[]), 0);
+        assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
+        assert_eq!(crc32(&(0..=255).collect::<Vec<u8>>()), 0x2905_8c73);
+        // Fixed checksum, independent of the datagram fixture's encoder.
+        let mut bytes = datagram(7, 9, 3, 0, 1, FLAG_KEYFRAME, &[0, 0, 0, 1, 0x65]);
+        bytes[28..32].copy_from_slice(&0xe2e1_538bu32.to_be_bytes());
+        assert_eq!(Packet::parse(&bytes).unwrap().payload, &[0, 0, 0, 1, 0x65]);
     }
 
     #[test]

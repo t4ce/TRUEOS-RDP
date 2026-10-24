@@ -4,11 +4,17 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 
+[[example]]
+name = "media-probe"
+path = "tools/media-probe.rs"
+
 [dependencies]
 bytemuck = { version = "1.25.0", features = ["derive"] }
+crc32fast = "1.5.0"
 futures = "0.3.32"
 microfont = "3.7.8"
 lz4_flex = "0.11.6"
+socket2 = "0.6.3"
 tar = "0.4.46"
 tempfile = "3.27.0"
 winit = "0.30.13"
