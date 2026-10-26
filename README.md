@@ -1,5 +1,14 @@
 # TRUEOS RDP input
 
+On Ubuntu, install the runtime dependencies before launching:
+
+```sh
+sudo apt install ffmpeg libxkbcommon-x11-0
+```
+
+FFmpeg decodes video; `libxkbcommon-x11-0` is required by the X11 window backend,
+including in NoView mode.
+
 StartCenter launches `target/release/trueos-rdp -NoView`.
 
 Ctrl+Space toggles local center-snap. Space press, repeat, and release are
