@@ -1,0 +1,18 @@
+[package]
+name = "trueos-rdp-server"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+members = ["protocol"]
+resolver = "3"
+
+[dependencies]
+signal-hook = "=0.3.18"
+trueos-rdp-protocol = { path = "protocol" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

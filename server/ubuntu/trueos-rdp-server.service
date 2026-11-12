@@ -1,0 +1,15 @@
+[Unit]
+Description=TRUEOS view-only Ubuntu window stream
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/trueos-rdp-server/environment
+ExecStart=%h/.local/bin/trueos-rdp-server --window ${TRUEOS_RDP_WINDOW} --display ${DISPLAY}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=graphical-session.target

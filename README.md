@@ -1,5 +1,10 @@
 # TRUEOS RDP input
 
+For the opposite direction—one Ubuntu window streamed into a native TRUEOS
+UI4 video frame—see the new [view-only Ubuntu server](server/README.md) and
+the `rdp` Blueprint in TRUEOS-Blueprints. The server is an independent Rust
+package under `server/`, using UDP 43402.
+
 On Ubuntu, install the runtime dependencies before launching:
 
 ```sh
