@@ -4,13 +4,16 @@
 
 The client has six independent paths:
 
-1. **Input data plane** — the existing THID packets go to UDP port 100. Their
-   magic, version, device ID, sequence handling, keyboard report, tablet
-   report, and startup probe are unchanged.
-2. **Media data plane** — `TME1GET1` is unicast to UDP port 9650. TME1
-   datagrams are CRC-checked and access units are reassembled in bounded
-   memory. Complete Annex-B access units feed one long-lived low-latency
-   decoder. The newest decoded RGBA frame replaces a persistent GPU texture.
+1. **Input data plane** — existing THID records are framed inside the
+   authenticated `trueos-rdp` SSH subsystem. Keyboard, absolute/relative tablet
+   motion, buttons, wheel and pointer-mode control retain their wire format.
+   Input is admitted only after the server's Ready record, and pending input
+   is discarded on session changes.
+2. **Media data plane** — TME1 records share the same encrypted SSH connection.
+   Their CRC and bounded access-unit reassembly remain unchanged. Complete
+   Annex-B access units feed one long-lived low-latency decoder. The newest
+   decoded RGBA frame replaces a persistent GPU texture. NoView opens the same
+   subsystem with viewing disabled; input authentication remains identical.
 3. **Presentation** — after the first decoded frame, the decorated winit window
    bypasses the local adapter command interpreter. The receiver hands an owned
    latest image to a dedicated GPU presenter, which updates one retained video
@@ -23,14 +26,14 @@ The client has six independent paths:
    remote-frame latency.
 4. **Startup UI** — until the first decoded video frame arrives, the local
    wallpaper-backed connection panel edits a shared host target. IP/HOST tab
-   changes retarget the TME1 subscriber and THID sender without changing either
-   wire format. Autoconnect retries continue in the background.
+   changes terminate the old SSH session and reconnect both paths together
+   without changing the inner wire formats. Autoconnect retries continue in the background.
 5. **Telemetry** — a disposable 4 Hz worker samples bounded media counters and
    stamps an opaque 2x `microfont` texture. It cycles headers, four-digit values,
    and units at the requested cadence. A click in its bottom-right bounds is
    consumed locally, stops and joins the worker, drops the retained GPU texture,
    and disables the panel for the remainder of the process. `ping` is a
-   best-effort mean UDP arrival interval: TME1 has no echo or sender timestamp
+   best-effort mean media-record arrival interval: TME1 has no echo or sender timestamp
    from which a real round-trip time could be calculated.
 6. **Drop uploads** — native winit file-drop events collect into one job per
    drop (a 200 ms quiet period ends the event burst). Each job captures the
@@ -74,41 +77,32 @@ recomposition request, or application-drawn window chrome. The connection
 panel is entirely local and has no relationship to the retired TCP scene
 protocol.
 
-## Current UDP session latch
+## SSH session and framing
 
-The selected IP address or hostname makes broadcast discovery unnecessary. The
-client:
+The client launches the system OpenSSH executable with `-T -s USER@HOST
+trueos-rdp`, using its existing config, keys, agent and terminal/askpass support.
+Host-key verification is required. There is no independent RDP key database or
+cryptography implementation. The kernel SSH authentication policy also governs
+this subsystem, including the existing development account-proof policy.
 
-1. binds UDP port 9650 once;
-2. unicasts `TME1GET1` every 500 ms until a valid session arrives;
-3. pins the expected server endpoint and session ID;
-4. drains the bounded 100-frame session;
-5. keeps the same socket and decoder alive, clears the pin, and immediately
-   requests the next session.
+Records have a one-byte type and a four-byte little-endian payload length,
+limited to 65,536 bytes. The client sends Hello (`1`, payload `[1, view]`) and
+Input (`2`, payload one complete THID record). The server sends Ready (`0x81`,
+width/height as little-endian u32), Control (`0x82`, existing eight-byte THIC
+record), and Video (`0x83`, one existing TME1 record of at most 1200 bytes).
+Unexpected records, oversized lengths, EOF and transport failure close the
+session; there is no fallback to unauthenticated UDP.
 
-Keeping the socket alive eliminates the rollover hole created by launching a
-new recording process after each bounded session. Transient UDP receive errors
-also return to this subscription loop instead of terminating the client media
-worker.
+One shared transport owns input and viewing. Input has a bounded 256-record
+queue. Media has an 8192-record queue, enough for a maximum 4096-fragment IDR
+plus short decoder scheduling delays. Full media queues reconnect for a fresh
+IDR rather than grow indefinitely or block the input producer. Old reader
+threads are joined before a replacement session may publish a new input route.
 
-## Small TCP control plane
+The client keeps existing bounded TME1 reassembly and decoder behavior. Each new
+stream session ID starts a fresh reassembler, including at bounded encoder
+rollover. No UDP subscription is needed. The headless media probe uses the same
+SSH transport and decoder as the desktop client.
 
-TCP should replace only the UDP subscription/liveness handshake. It should not
-revive the former TRDP scene protocol and should not carry video or HID data.
-
-The first useful protocol needs only:
-
-- client hello: protocol version and client UDP media port;
-- stream request: start or stop, requested raster and cadence;
-- server acceptance: session identifier and actual raster/cadence;
-- ping/pong or an equivalent connection-liveness rule;
-- explicit rejection with a small reason code.
-
-The TCP connection owns the lifetime of its media subscription. On disconnect,
-TRUEOS stops that subscriber. TME1 remains the UDP media wire format and THID
-remains the independent UDP input format.
-
-No TCP media-control bytes are sent by the current client because the live kernel still
-exposes the old scene protocol on that port. The control protocol should be
-added to both sides together, behind a new magic/version, so an old endpoint
-cannot misinterpret it.
+Drop uploads remain a separate public TRUEOSFS HTTP feature with the filesystem
+service's own access checks; they confer no input or viewing authority.

@@ -1,12 +1,9 @@
 use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::process::{ChildStdin, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, ChildStdin, Command, Stdio};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
-
-use crate::target::RemoteTarget;
 
 pub const VIDEO_WIDTH: u32 = 2560;
 pub const VIDEO_HEIGHT: u32 = 1440;
@@ -23,39 +20,11 @@ const MAX_ACCESS_UNIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_INFLIGHT_ACCESS_UNITS: usize = 32;
 const MAX_ACCESS_UNIT_SEQUENCE_AHEAD: u32 = 4096;
 const REORDER_TIMEOUT: Duration = Duration::from_millis(750);
-const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
-const SUBSCRIBE_INTERVAL: Duration = Duration::from_millis(500);
-const SUBSCRIBE_TOKEN: &[u8; 8] = b"TME1GET1";
-// A keyframe arrives as a burst while the receiver may briefly wait for the
-// decoder pipe. Bound the socket headroom without waiting to fill it.
-const RECEIVE_BUFFER_BYTES: usize = 1024 * 1024;
-
 const FLAG_START: u8 = 1 << 0;
 const FLAG_END: u8 = 1 << 1;
 const FLAG_KEYFRAME: u8 = 1 << 2;
 const FLAG_SESSION_END: u8 = 1 << 3;
 const KNOWN_FLAGS: u8 = FLAG_START | FLAG_END | FLAG_KEYFRAME | FLAG_SESSION_END;
-
-#[derive(Clone, Debug)]
-pub struct MediaConfig {
-    bind: SocketAddr,
-    target: RemoteTarget,
-}
-
-impl MediaConfig {
-    pub fn new(target: RemoteTarget) -> Self {
-        let bind = match target.host().parse::<IpAddr>() {
-            Ok(IpAddr::V6(_)) => "[::]:9650".parse().expect("valid IPv6 bind"),
-            _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 9650),
-        };
-        Self { bind, target }
-    }
-
-    pub fn with_bind_port(mut self, port: u16) -> Self {
-        self.bind.set_port(port);
-        self
-    }
-}
 
 #[derive(Debug)]
 pub struct VideoFrame {
@@ -95,7 +64,7 @@ pub struct MediaDiagnostics {
     /// Receiver anomalies include sequence gaps, duplicates and reassembly skips.
     pub receive_anomalies: u64,
     pub received_datagrams: u64,
-    /// UDP payload plus IP/UDP headers; excludes Ethernet framing.
+    /// Encoded media payload bytes delivered inside SSH; excludes SSH framing.
     pub received_ip_bytes: u64,
 }
 
@@ -104,7 +73,7 @@ pub struct MediaMetrics {
     pub frames_per_second: u16,
     /// Best-effort mean arrival interval for the last 100 accepted datagrams.
     pub latency_ms: u16,
-    /// Mean wire consumption across at most the last 1000 accepted datagrams.
+    /// Mean media payload consumption across at most the last 1000 records.
     pub bandwidth_kbit: u16,
 }
 
@@ -112,24 +81,30 @@ pub struct MediaMetrics {
 pub struct MediaFeed {
     latest_frame: Arc<Mutex<Option<VideoFrame>>>,
     status: Arc<Mutex<MediaStatus>>,
+    _decoder: Arc<DecoderProcess>,
+}
+
+struct DecoderProcess {
+    child: Mutex<Child>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl Drop for DecoderProcess {
+    fn drop(&mut self) {
+        // Stop the writer before app exit closes its raw-video output pipe.
+        // Cleanup is best effort; an already-exited decoder needs no ceremony.
+        self.stopping.store(true, Ordering::Release);
+        if let Ok(child) = self.child.get_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 impl MediaFeed {
-    pub fn spawn(config: MediaConfig) -> io::Result<Self> {
-        let socket = UdpSocket::bind(config.bind)?;
-        let socket_options = socket2::SockRef::from(&socket);
-        if let Err(error) = socket_options.set_recv_buffer_size(RECEIVE_BUFFER_BYTES) {
-            eprintln!("trueos-rdp: cannot enlarge media receive buffer: {error}");
-        }
-        match socket_options.recv_buffer_size() {
-            Ok(effective) => eprintln!(
-                "trueos-rdp: media receive buffer requested={} effective={effective}",
-                RECEIVE_BUFFER_BYTES
-            ),
-            Err(error) => eprintln!("trueos-rdp: cannot query media receive buffer: {error}"),
-        }
-        socket.set_read_timeout(Some(Duration::from_millis(100)))?;
-
+    pub fn spawn_ssh(
+        receiver: std::sync::mpsc::Receiver<crate::ssh::MediaEvent>,
+    ) -> io::Result<Self> {
         let mut child = Command::new("ffmpeg")
             .args([
                 "-hide_banner",
@@ -171,21 +146,24 @@ impl MediaFeed {
 
         let latest_frame = Arc::new(Mutex::new(None));
         let status = Arc::new(Mutex::new(MediaStatus::default()));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let decoder = Arc::new(DecoderProcess { child: Mutex::new(child), stopping: stopping.clone() });
         let decoder_latest = Arc::clone(&latest_frame);
         let decoder_status = Arc::clone(&status);
-        thread::spawn(move || decode_frames(stdout, decoder_latest, decoder_status));
+        let decoder_stopping = stopping.clone();
+        thread::spawn(move || decode_frames(stdout, decoder_latest, decoder_status, decoder_stopping));
         let receiver_status = Arc::clone(&status);
         thread::spawn(move || {
-            let result = receive_media(socket, config.target, stdin, receiver_status.clone());
-            if let Err(error) = result {
+            let result = receive_ssh_media(receiver, stdin, receiver_status.clone());
+            if let Err(error) = result && !stopping.load(Ordering::Acquire) {
                 set_error(&receiver_status, format!("media receiver stopped: {error}"));
             }
-            drop(child);
         });
 
         Ok(Self {
             latest_frame,
             status,
+            _decoder: decoder,
         })
     }
 
@@ -294,12 +272,15 @@ fn decode_frames(
     mut stdout: impl Read,
     latest_frame: Arc<Mutex<Option<VideoFrame>>>,
     status: Arc<Mutex<MediaStatus>>,
+    stopping: Arc<AtomicBool>,
 ) {
     let mut sequence = 0u64;
     loop {
         let mut rgba = vec![0u8; VIDEO_RGBA_BYTES];
         if let Err(error) = stdout.read_exact(&mut rgba) {
-            set_error(&status, format!("ffmpeg output stopped: {error}"));
+            if !stopping.load(Ordering::Acquire) {
+                set_error(&status, format!("ffmpeg output stopped: {error}"));
+            }
             return;
         }
         sequence = sequence.saturating_add(1);
@@ -611,226 +592,82 @@ impl Reassembler {
     }
 }
 
-struct ActiveSession {
-    peer: SocketAddr,
-    id: u32,
-    last_packet: Instant,
-    last_datagram_sequence: Option<u32>,
-    reassembler: Reassembler,
-}
-
-fn receive_media(
-    socket: UdpSocket,
-    target: RemoteTarget,
+fn receive_ssh_media(
+    receiver: std::sync::mpsc::Receiver<crate::ssh::MediaEvent>,
     mut decoder: ChildStdin,
     status: Arc<Mutex<MediaStatus>>,
 ) -> io::Result<()> {
-    eprintln!(
-        "trueos-rdp: media listening={} subscription-host={}",
-        socket.local_addr()?,
-        target.host()
-    );
-    let mut active_host = String::new();
-    let mut subscribe_target = None;
-    let mut active: Option<ActiveSession> = None;
-    let mut previous_session_id = None;
-    let mut last_subscription = None;
-    let mut last_resolve_attempt = None;
-    let mut datagram = [0u8; MAX_DATAGRAM_LEN + 1];
-
-    loop {
-        let now = Instant::now();
-        let current_host = target.host();
-        if current_host != active_host {
-            active_host = current_host;
-            subscribe_target = None;
-            active = None;
-            previous_session_id = None;
-            last_subscription = None;
-            last_resolve_attempt = None;
-            if let Ok(mut current) = status.lock() {
-                current.connected = false;
-                current.last_error = None;
-            }
-        }
-        if subscribe_target.is_none()
-            && last_resolve_attempt
-                .is_none_or(|attempt: Instant| now.duration_since(attempt) >= SUBSCRIBE_INTERVAL)
-        {
-            last_resolve_attempt = Some(now);
-            match target.resolve(9650) {
-                Ok(resolved) => {
-                    eprintln!(
-                        "trueos-rdp: media subscription target={} host={}",
-                        resolved, active_host
-                    );
-                    subscribe_target = Some(resolved);
-                }
-                Err(error) => {
-                    set_error(
-                        &status,
-                        format!("cannot resolve media target {}: {error}", active_host),
-                    );
+    let mut session: Option<(u32, Reassembler)> = None;
+    for event in receiver {
+        match event {
+            crate::ssh::MediaEvent::Connected => {
+                session = None;
+                if let Ok(mut current) = status.lock() {
+                    current.last_error = None;
+                    current.reset_metrics();
                 }
             }
-        }
-        if active.is_none()
-            && last_subscription
-                .is_none_or(|sent: Instant| now.duration_since(sent) >= SUBSCRIBE_INTERVAL)
-            && let Some(subscription) = subscribe_target
-        {
-            match socket.send_to(SUBSCRIBE_TOKEN, subscription) {
-                Ok(sent) if sent == SUBSCRIBE_TOKEN.len() => {
-                    last_subscription = Some(now);
-                }
-                Ok(_) => {
-                    set_error(&status, "short media subscription".to_string());
-                    subscribe_target = None;
-                }
-                Err(error) => {
-                    set_error(&status, format!("media subscription failed: {error}"));
-                    subscribe_target = None;
-                }
+            crate::ssh::MediaEvent::Disconnected(error) => {
+                session = None;
+                set_error(&status, error);
             }
-        }
-
-        match socket.recv_from(&mut datagram) {
-            Ok((length, peer)) => {
-                if datagram[..length] == *SUBSCRIBE_TOKEN {
-                    continue;
-                }
-                let packet = match Packet::parse(&datagram[..length]) {
+            crate::ssh::MediaEvent::Video(datagram) => {
+                let now = Instant::now();
+                let packet = match Packet::parse(&datagram) {
                     Ok(packet) => packet,
-                    Err(error) => {
+                    Err(_) => {
                         if let Ok(mut current) = status.lock() {
-                            current.dropped_datagrams = current.dropped_datagrams.saturating_add(1);
+                            current.dropped_datagrams += 1;
                         }
-                        eprintln!("trueos-rdp: dropped media datagram: {error:?}");
                         continue;
                     }
                 };
-
-                if active.is_none() {
-                    if Some(peer) != subscribe_target
-                        || previous_session_id == Some(packet.session_id)
-                    {
-                        continue;
-                    }
-                    eprintln!(
-                        "trueos-rdp: media connected peer={} session=0x{:08x}",
-                        peer, packet.session_id
-                    );
-                    active = Some(ActiveSession {
-                        peer,
-                        id: packet.session_id,
-                        last_packet: now,
-                        last_datagram_sequence: None,
-                        reassembler: Reassembler::new(),
-                    });
+                if session
+                    .as_ref()
+                    .is_none_or(|(id, _)| *id != packet.session_id)
+                {
+                    session = Some((packet.session_id, Reassembler::new()));
                     if let Ok(mut current) = status.lock() {
                         current.connected = true;
-                        current.sessions = current.sessions.saturating_add(1);
+                        current.sessions += 1;
                         current.last_error = None;
-                        current.reset_metrics();
                     }
                 }
-
-                let session = active.as_mut().unwrap();
-                if peer != session.peer || packet.session_id != session.id {
-                    continue;
-                }
+                let (_, reassembler) = session.as_mut().unwrap();
                 if let Ok(mut current) = status.lock() {
-                    let wire_overhead = if peer.is_ipv6() { 48 } else { 28 };
-                    current.record_datagram(now, length.saturating_add(wire_overhead));
+                    current.record_datagram(now, datagram.len());
                 }
-                session.last_packet = now;
-                if let Some(previous) = session.last_datagram_sequence
-                    && packet.datagram_seq != previous.wrapping_add(1)
-                    && let Ok(mut current) = status.lock()
-                {
-                    current.dropped_datagrams = current.dropped_datagrams.saturating_add(1);
-                }
-                session.last_datagram_sequence = Some(packet.datagram_seq);
-                match session.reassembler.insert(&packet, now) {
-                    Ok(true) => {}
-                    Ok(false) | Err(_) => {
-                        if let Ok(mut current) = status.lock() {
-                            current.dropped_datagrams = current.dropped_datagrams.saturating_add(1);
-                        }
+                if !matches!(reassembler.insert(&packet, now), Ok(true)) {
+                    if let Ok(mut current) = status.lock() {
+                        current.dropped_datagrams += 1;
                     }
                 }
-            }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) => {}
-            Err(error) => {
-                set_error(
-                    &status,
-                    format!("media receive interrupted, retrying: {error}"),
-                );
-                active = None;
-                last_subscription = None;
-                thread::sleep(Duration::from_millis(50));
-            }
-        }
-
-        let now = Instant::now();
-        let mut ended = false;
-        if let Some(session) = active.as_mut() {
-            loop {
-                if let Some((sequence, access_unit)) = session.reassembler.take_next_complete() {
-                    let session_end = access_unit.session_end;
-                    let bytes = access_unit.into_bytes();
-                    if !has_annex_b_start_code(&bytes) {
-                        if let Ok(mut current) = status.lock() {
-                            current.dropped_datagrams = current.dropped_datagrams.saturating_add(1);
+                loop {
+                    if let Some((_, unit)) = reassembler.take_next_complete() {
+                        let bytes = unit.into_bytes();
+                        if has_annex_b_start_code(&bytes) {
+                            decoder.write_all(&bytes)?;
+                            if let Ok(mut current) = status.lock() {
+                                current.access_units += 1;
+                            }
                         }
                         continue;
                     }
-                    decoder.write_all(&bytes)?;
-                    if let Ok(mut current) = status.lock() {
-                        current.access_units = current.access_units.saturating_add(1);
-                    }
-                    if session_end {
-                        eprintln!(
-                            "trueos-rdp: media session complete id=0x{:08x} final_au={sequence}",
-                            session.id
-                        );
-                        ended = true;
+                    let dropped = reassembler.skip_stalled(now);
+                    if dropped == 0 {
                         break;
                     }
-                    continue;
-                }
-                let dropped = session.reassembler.skip_stalled(now);
-                if dropped != 0 {
                     if let Ok(mut current) = status.lock() {
-                        current.dropped_datagrams =
-                            current.dropped_datagrams.saturating_add(dropped);
+                        current.dropped_datagrams += dropped;
                     }
-                    continue;
                 }
-                break;
-            }
-            if now.duration_since(session.last_packet) >= SESSION_IDLE_TIMEOUT {
-                set_error(
-                    &status,
-                    format!("media session 0x{:08x} timed out", session.id),
-                );
-                ended = true;
-            }
-        }
-
-        if ended {
-            previous_session_id = active.as_ref().map(|session| session.id);
-            active = None;
-            last_subscription = None;
-            if let Ok(mut current) = status.lock() {
-                current.connected = false;
             }
         }
     }
+    Err(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "SSH media channel closed",
+    ))
 }
 
 fn has_annex_b_start_code(bytes: &[u8]) -> bool {

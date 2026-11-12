@@ -2,6 +2,7 @@ mod capture;
 mod input;
 mod input_log;
 mod media;
+mod ssh;
 mod target;
 mod telemetry;
 mod upload;
@@ -29,13 +30,11 @@ use crate::window::{
 };
 
 use crate::input::{KeyboardInput, RemoteInput, TabletDeltaInput, TabletInput};
-use crate::media::{MediaConfig, MediaFeed, VideoFrame};
+use crate::media::{MediaFeed, VideoFrame};
 use crate::target::{RemoteTarget, strip_port};
 use crate::telemetry::TelemetryHud;
 
 const DEFAULT_HOST: &str = "192.168.178.94";
-const INPUT_PORT: u16 = 100;
-const MEDIA_PORT: u16 = 9650;
 const INITIAL_WINDOW_WIDTH: u32 = 1280;
 const INITIAL_WINDOW_HEIGHT: u32 = 800;
 const LOCAL_CURSOR_RADIUS: f32 = 4.0;
@@ -1155,7 +1154,7 @@ fn looks_like_ip(host: &str) -> bool {
 
 fn target_char_allowed(host_mode: bool, ch: char) -> bool {
     if host_mode {
-        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-')
+        ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_' | '@')
     } else {
         ch.is_ascii_digit() || ch == '.'
     }
@@ -1424,8 +1423,8 @@ fn usage() {
     eprintln!(
         "TRUEOS Remote Desktop\n\n\
          Usage: trueos-rdp [HOST|HOST:PORT] [--no-view] [--raw-capture]\n\n\
-         HOST defaults to {DEFAULT_HOST}. Input always uses UDP port {INPUT_PORT}; \
-         video uses UDP port {MEDIA_PORT}. --no-view preserves input-only mode.\n\n\
+         HOST defaults to {DEFAULT_HOST}; use USER@HOST to select an account. \
+         Input and video share SSH port 22. --no-view preserves input-only mode.\n\n\
          Ctrl+Space toggles local center-snap. Default capture uses cursor positions for nested RDP. \
          --raw-capture enables compositor grab and raw deltas for a physical mouse.\n\
          Drop files or folders to upload a tar.lz4 Blob to /RdpUpload. F8 retries failed drops."
@@ -1435,22 +1434,21 @@ fn usage() {
 fn run(config: AppConfig) -> Result<(), String> {
     let target = RemoteTarget::new(config.host.clone());
     let (input_tx, input_rx): (Sender<RemoteInput>, Receiver<RemoteInput>) = mpsc::channel();
-    let center_snap = input::spawn_sender(target.clone(), input_rx);
+    let (transport, media_rx) = ssh::SshTransport::spawn(target.clone(), !config.no_view);
+    let center_snap = input::spawn_sender(transport, input_rx);
 
     let media = if config.no_view {
         None
     } else {
         Some(
-            MediaFeed::spawn(MediaConfig::new(target.clone()))
+            MediaFeed::spawn_ssh(media_rx)
                 .map_err(|error| format!("cannot start media receiver: {error}"))?,
         )
     };
 
     input_log::write(format_args!(
-        "host={} input=udp/{} media=udp/{} mode={}",
+        "host={} transport=ssh subsystem=trueos-rdp mode={}",
         config.host,
-        INPUT_PORT,
-        MEDIA_PORT,
         if config.no_view {
             "input-only"
         } else {

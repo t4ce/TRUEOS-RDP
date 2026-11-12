@@ -1,14 +1,29 @@
-# TRUEOS RDP input
+# TRUEOS RDP over SSH
 
 For the opposite direction—one Ubuntu window streamed into a native TRUEOS
 UI4 video frame—see the new [view-only Ubuntu server](server/README.md) and
 the `rdp` Blueprint in TRUEOS-Blueprints. The server is an independent Rust
 package under `server/`, using UDP 43402.
 
+The desktop client opens one OpenSSH subsystem session, `trueos-rdp`, on port
+22. Input and video share that authenticated, encrypted session in both View and
+NoView mode. `--no-view` omits video; it does not select a different input or login
+path. There is no UDP input or unauthenticated video subscription fallback.
+
+Use `trueos-rdp t4ce@192.168.178.94` to select the SSH account explicitly.
+Otherwise the client uses `$USER`/`$USERNAME` (or `t4ce` when neither is set).
+OpenSSH uses the existing SSH config, agent and keys. Host-key verification is
+required: establish the trusted rig host key with ordinary SSH first if needed.
+The kernel controls account proof, including its current development policy;
+the client adds no admission bypass and stores no separate RDP credential.
+OpenSSH errors are preserved in the input log, including when StartCenter hides
+stderr. When launched from a terminal, existing key/Cry prompts use OpenSSH's
+normal terminal/askpass behavior.
+
 On Ubuntu, install the runtime dependencies before launching:
 
 ```sh
-sudo apt install ffmpeg libxkbcommon-x11-0
+sudo apt install openssh-client ffmpeg libxkbcommon-x11-0
 ```
 
 FFmpeg decodes video; `libxkbcommon-x11-0` is required by the X11 window backend,
@@ -51,26 +66,25 @@ tail -f ~/.local/state/trueos-rdp/input.log
 
 `Ctrl+Space consumed locally` confirms the shortcut. `input capture=true`
 counts incoming raw and cursor events once per second, including zero-event
-intervals. `UDP sent tablet-delta` records successful local UDP sends (first
-five and every hundredth packet); it does not prove receipt by TRUEOS.
+intervals. `SSH RDP ready` confirms subsystem admission; `SSH input not sent` records
+closed, unready or congested sessions. No input is replayed into a new session.
 
 Build and verify with `cargo test` and `cargo build --release`, then relaunch
 the RDP tool from StartCenter to load the rebuilt executable.
 
-To measure the real UDP receiver and ffmpeg decoder without a graphical window:
+To measure the SSH receiver and ffmpeg decoder without a graphical window:
 
 ```sh
 cargo run --release --example media-probe -- 192.168.178.94 40
 ```
 
-The probe subscribes from an ephemeral local UDP port and prints cumulative
+The probe opens the same authenticated SSH subsystem and prints cumulative
 access units, decoded frames, datagrams, and receiver anomalies once per second.
-The rate is IP/UDP traffic in Mbps, excluding Ethernet framing. Anomalies include
+The rate counts encoded media payload in Mbps, excluding SSH framing. Anomalies include
 gaps, reordered or duplicate datagrams, and reassembly skips; they are not an
-exact packet-loss count. Run a single video subscriber at a time, and allow time
-for the rig's previous stream session to finish before comparing active samples.
-The viewer logs the effective receive buffer at startup; the operating system
-may clamp the 1 MiB request or include additional accounting in the reported size.
+exact packet-loss count. Run a single viewer at a time when comparing active samples. Media records
+are bounded independently of the input queue so a slow decoder cannot grow
+unlimited session buffering.
 
 On older Intel Haswell GPUs (for example HD Graphics 4600), Mesa may report
 Vulkan conformance version `0.0.0.0`. wgpu hides these adapters by default,

@@ -1,4 +1,4 @@
-//! Headless probe using the viewer's actual UDP receiver and ffmpeg decoder.
+//! Headless probe using the viewer's actual SSH receiver and ffmpeg decoder.
 //! Run: cargo run --release --example media-probe -- [HOST] [SECONDS]
 
 #[allow(dead_code)]
@@ -7,6 +7,13 @@ mod media;
 #[allow(dead_code)]
 #[path = "../src/target.rs"]
 mod target;
+
+#[allow(dead_code)]
+#[path = "../src/input_log.rs"]
+mod input_log;
+#[allow(dead_code)]
+#[path = "../src/ssh.rs"]
+mod ssh;
 
 use std::{
     env, io, thread,
@@ -27,8 +34,8 @@ fn main() -> io::Result<()> {
             "usage: media-probe [HOST] [SECONDS:1..300]",
         ));
     }
-    let config = media::MediaConfig::new(target::RemoteTarget::new(host)).with_bind_port(0);
-    let feed = media::MediaFeed::spawn(config)?;
+    let (_transport, receiver) = ssh::SshTransport::spawn(target::RemoteTarget::new(host), true);
+    let feed = media::MediaFeed::spawn_ssh(receiver)?;
     let started = Instant::now();
     let mut last_sample = started;
     let mut last_bytes = 0;
@@ -46,7 +53,7 @@ fn main() -> io::Result<()> {
             / 1_000_000.0;
         let decoded_fps = totals.decoded_frames.saturating_sub(last_frames) as f64 / elapsed;
         println!(
-            "elapsed_s={:.3} connected={} sessions={} au={} decoded={} fps={:.2} datagrams={} anomalies={} ip_mbps={:.3} error={:?}",
+            "elapsed_s={:.3} connected={} sessions={} au={} decoded={} fps={:.2} datagrams={} anomalies={} payload_mbps={:.3} error={:?}",
             started.elapsed().as_secs_f64(),
             status.connected,
             totals.sessions,
@@ -64,7 +71,7 @@ fn main() -> io::Result<()> {
     }
     let totals = feed.diagnostics();
     println!(
-        "summary elapsed_s={:.3} sessions={} au={} decoded={} datagrams={} anomalies={} ip_bytes={}",
+        "summary elapsed_s={:.3} sessions={} au={} decoded={} datagrams={} anomalies={} payload_bytes={}",
         started.elapsed().as_secs_f64(),
         totals.sessions,
         totals.access_units,

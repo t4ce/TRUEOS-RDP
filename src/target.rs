@@ -33,6 +33,7 @@ impl RemoteTarget {
 }
 
 pub fn resolve_host(host: &str, port: u16) -> io::Result<SocketAddr> {
+    let host = host.rsplit_once('@').map_or(host, |(_, host)| host);
     let mut addresses = (host, port).to_socket_addrs()?;
     let first = addresses
         .next()

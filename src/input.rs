@@ -1,5 +1,4 @@
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -7,8 +6,6 @@ use std::sync::{
 };
 use std::thread;
 use std::time::{Duration, Instant};
-
-use crate::target::RemoteTarget;
 
 const HID_UDP_MAGIC: &[u8; 4] = b"THID";
 const HID_UDP_VERSION: u8 = 1;
@@ -23,7 +20,6 @@ const CONTROL_POINTER_MODE_VALID: u16 = 1 << 1;
 const CONTROL_POINTER_MODE_RELATIVE: u16 = 1 << 2;
 const INPUT_FLAG_RELATIVE: u16 = 1 << 15;
 const READ_TIMEOUT: Duration = Duration::from_millis(50);
-const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
 pub const INPUT_FLAG_MOTION: u16 = 1 << 0;
 pub const INPUT_FLAG_WHEEL: u16 = 1 << 1;
@@ -92,71 +88,6 @@ impl HidUdpSeqs {
     }
 }
 
-#[derive(Debug)]
-struct HidUdpSender {
-    socket: UdpSocket,
-    target: SocketAddr,
-}
-
-impl HidUdpSender {
-    fn connect(target: SocketAddr) -> io::Result<Self> {
-        let bind_addr = if target.is_ipv4() {
-            "0.0.0.0:0"
-        } else {
-            "[::]:0"
-        };
-        Ok(Self {
-            socket: UdpSocket::bind(bind_addr)?,
-            target,
-        })
-    }
-
-    fn send_keyboard(&self, seq: u32, input: KeyboardInput) -> io::Result<()> {
-        let payload = [
-            input.modifiers,
-            0,
-            input.keys[0],
-            input.keys[1],
-            input.keys[2],
-            input.keys[3],
-            input.keys[4],
-            input.keys[5],
-        ];
-        self.send_hid_packet(HID_UDP_KIND_KEYBOARD, 0, seq, &payload)
-    }
-
-    fn send_tablet_delta(&self, seq: u32, input: TabletDeltaInput) -> io::Result<()> {
-        let payload = encode_tablet_delta_payload(input);
-        self.send_hid_packet(HID_UDP_KIND_TABLET, INPUT_FLAG_RELATIVE, seq, &payload)
-    }
-
-    fn send_control(&self, seq: u32, flags: u16) -> io::Result<()> {
-        self.send_hid_packet(HID_UDP_KIND_CONTROL, flags, seq, &[])
-    }
-
-    fn send_tablet(&self, seq: u32, input: TabletInput) -> io::Result<()> {
-        let mut payload = Vec::with_capacity(16);
-        payload.extend_from_slice(&input.x_q16.to_le_bytes());
-        payload.extend_from_slice(&input.y_q16.to_le_bytes());
-        payload.extend_from_slice(&input.buttons_down.to_le_bytes());
-        payload.extend_from_slice(&input.wheel.to_le_bytes());
-        payload.extend_from_slice(&0u16.to_le_bytes());
-        self.send_hid_packet(HID_UDP_KIND_TABLET, input.flags, seq, &payload)
-    }
-
-    fn send_hid_packet(&self, kind: u8, flags: u16, seq: u32, payload: &[u8]) -> io::Result<()> {
-        let packet = encode_hid_packet(kind, flags, seq, payload);
-        let sent = self.socket.send_to(&packet, self.target)?;
-        if sent != packet.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::WriteZero,
-                format!("short UDP HID send: {sent}/{}", packet.len()),
-            ));
-        }
-        Ok(())
-    }
-}
-
 fn encode_tablet_delta_payload(input: TabletDeltaInput) -> [u8; 16] {
     let mut payload = [0u8; 16];
     payload[0..4].copy_from_slice(&(i32::from(input.dx) as u32).to_le_bytes());
@@ -180,17 +111,55 @@ fn encode_hid_packet(kind: u8, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> 
 }
 
 fn send_input(
-    sender: &HidUdpSender,
+    transport: &crate::ssh::SshTransport,
     sequences: &mut HidUdpSeqs,
     input: RemoteInput,
 ) -> io::Result<()> {
+    transport.send_input(encode_input(sequences, input))
+}
+
+fn encode_input(sequences: &mut HidUdpSeqs, input: RemoteInput) -> Vec<u8> {
     match input {
-        RemoteInput::Tablet(input) => sender.send_tablet(sequences.next_tablet(), input),
-        RemoteInput::TabletDelta(input) => sender.send_tablet_delta(sequences.next_tablet(), input),
-        RemoteInput::Keyboard(input) => sender.send_keyboard(sequences.next_keyboard(), input),
-        RemoteInput::SetPointerMode { relative } => sender.send_control(
-            sequences.next_control(),
+        RemoteInput::Keyboard(input) => encode_hid_packet(
+            HID_UDP_KIND_KEYBOARD,
+            0,
+            sequences.next_keyboard(),
+            &[
+                input.modifiers,
+                0,
+                input.keys[0],
+                input.keys[1],
+                input.keys[2],
+                input.keys[3],
+                input.keys[4],
+                input.keys[5],
+            ],
+        ),
+        RemoteInput::TabletDelta(input) => encode_hid_packet(
+            HID_UDP_KIND_TABLET,
+            INPUT_FLAG_RELATIVE,
+            sequences.next_tablet(),
+            &encode_tablet_delta_payload(input),
+        ),
+        RemoteInput::Tablet(input) => {
+            let mut payload = Vec::with_capacity(16);
+            payload.extend_from_slice(&input.x_q16.to_le_bytes());
+            payload.extend_from_slice(&input.y_q16.to_le_bytes());
+            payload.extend_from_slice(&input.buttons_down.to_le_bytes());
+            payload.extend_from_slice(&input.wheel.to_le_bytes());
+            payload.extend_from_slice(&[0, 0]);
+            encode_hid_packet(
+                HID_UDP_KIND_TABLET,
+                input.flags,
+                sequences.next_tablet(),
+                &payload,
+            )
+        }
+        RemoteInput::SetPointerMode { relative } => encode_hid_packet(
+            HID_UDP_KIND_CONTROL,
             pointer_mode_control_flags(relative),
+            sequences.next_control(),
+            &[],
         ),
     }
 }
@@ -204,172 +173,59 @@ fn pointer_mode_control_flags(relative: bool) -> u16 {
         }
 }
 
-fn receive_control(
-    sender: &HidUdpSender,
-    center_snap: &AtomicBool,
-    release_pending: &mut bool,
-) -> bool {
-    let mut received = false;
-    let mut reply = [0u8; 32];
-    loop {
-        match sender.socket.recv_from(&mut reply) {
-            Ok((8, peer))
-                if peer == sender.target
-                    && &reply[..4] == CONTROL_MAGIC
-                    && reply[4] == HID_UDP_VERSION
-                    && u16::from_le_bytes([reply[6], reply[7]]) == HID_UDP_DEVICE_ID =>
-            {
-                received = true;
-                let enabled = reply[5] & 1 != 0;
-                if !enabled {
-                    *release_pending = false;
-                }
-                if !*release_pending {
-                    center_snap.store(enabled, Ordering::Release);
-                }
-            }
-            Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return received,
-            Err(_) => return received,
-        }
-    }
-}
-
-pub fn spawn_sender(target: RemoteTarget, input_rx: Receiver<RemoteInput>) -> Arc<AtomicBool> {
+pub fn spawn_sender(
+    transport: crate::ssh::SshTransport,
+    input_rx: Receiver<RemoteInput>,
+) -> Arc<AtomicBool> {
     let center_snap = Arc::new(AtomicBool::new(false));
-    let sender_center_snap = Arc::clone(&center_snap);
+    let sender_center_snap = center_snap.clone();
     thread::spawn(move || {
         let mut sequences = HidUdpSeqs::new();
-        let mut sender = None;
-        let mut active_host = String::new();
-        let mut last_attempt = None;
+        let mut generation = transport.generation();
         let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
-        let mut release_pending = false;
         let mut local_pointer_mode = None;
-        let mut delta_packets = 0u64;
-        let mut last_reply = None;
-        let mut receiver_responding = None;
         loop {
-            let current_host = target.host();
-            if current_host != active_host {
-                active_host = current_host;
-                sender = None;
-                last_attempt = None;
-                release_pending = false;
+            if generation != transport.generation() {
+                generation = transport.generation();
+                // Never replay input accumulated for the previous target/session.
+                while input_rx.try_recv().is_ok() {}
+                sequences = HidUdpSeqs::new();
                 sender_center_snap.store(false, Ordering::Release);
             }
-
-            if sender.is_none()
-                && last_attempt
-                    .is_none_or(|attempt: Instant| attempt.elapsed() >= CONNECT_RETRY_DELAY)
-            {
-                last_attempt = Some(Instant::now());
-                match target.resolve(100) {
-                    Ok(target_addr) => match HidUdpSender::connect(target_addr) {
-                        Ok(connected) => {
-                            sequences = HidUdpSeqs::new();
-                            last_reply = None;
-                            receiver_responding = None;
-                            let _ = connected.socket.set_nonblocking(true);
-                            crate::input_log::write(format_args!(
-                                "UDP HID target={} device={} counter=per-process",
-                                target_addr, HID_UDP_DEVICE_ID
-                            ));
-                            let probe = RemoteInput::Tablet(TabletInput {
-                                x_q16: 32768,
-                                y_q16: 32768,
-                                buttons_down: 0,
-                                wheel: 0,
-                                flags: INPUT_FLAG_MOTION,
-                            });
-                            if let Err(error) = send_input(&connected, &mut sequences, probe) {
-                                eprintln!("trueos-rdp: UDP HID probe failed: {error}");
-                            }
-                            sender = Some(connected);
-                        }
-                        Err(error) => {
-                            eprintln!("trueos-rdp: UDP HID unavailable: {error}");
-                        }
-                    },
-                    Err(error) => eprintln!(
-                        "trueos-rdp: cannot resolve UDP HID target {}: {error}",
-                        active_host
-                    ),
+            for reply in transport.take_controls() {
+                if reply.len() == 8
+                    && reply.starts_with(CONTROL_MAGIC)
+                    && reply[4] == 1
+                    && u16::from_le_bytes([reply[6], reply[7]]) == HID_UDP_DEVICE_ID
+                {
+                    sender_center_snap.store(
+                        reply[5] & 1 != 0 && local_pointer_mode != Some(false),
+                        Ordering::Release,
+                    );
                 }
             }
-
-            if let Some(connected) = sender.as_ref() {
-                if receive_control(connected, &sender_center_snap, &mut release_pending) {
-                    last_reply = Some(Instant::now());
-                }
-                let responding =
-                    last_reply.is_some_and(|at: Instant| at.elapsed() < Duration::from_secs(2));
-                if receiver_responding != Some(responding) {
-                    crate::input_log::write(format_args!(
-                        "UDP HID receiver responding={responding} target={} (control reply)",
-                        connected.target
-                    ));
-                    receiver_responding = Some(responding);
-                }
-                if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
-                    last_control_poll = Instant::now();
-                    let flags = local_pointer_mode
-                        .map(pointer_mode_control_flags)
-                        .unwrap_or(0);
-                    if connected
-                        .send_control(sequences.next_control(), flags)
-                        .is_err()
-                    {
-                        sender = None;
-                        sender_center_snap.store(false, Ordering::Release);
-                    }
-                }
+            if last_control_poll.elapsed() >= CONTROL_POLL_INTERVAL {
+                last_control_poll = Instant::now();
+                let flags = local_pointer_mode
+                    .map(pointer_mode_control_flags)
+                    .unwrap_or(0);
+                let _ = transport.send_input(encode_hid_packet(
+                    HID_UDP_KIND_CONTROL,
+                    flags,
+                    sequences.next_control(),
+                    &[],
+                ));
             }
-
             match input_rx.recv_timeout(READ_TIMEOUT) {
                 Ok(input) => {
-                    let pointer_mode = match &input {
-                        RemoteInput::SetPointerMode { relative } => Some(*relative),
-                        _ => None,
-                    };
-                    if let Some(relative) = pointer_mode {
+                    if let RemoteInput::SetPointerMode { relative } = input {
                         local_pointer_mode = Some(relative);
-                    }
-                    if let Some(connected) = sender.as_ref() {
-                        match send_input(connected, &mut sequences, input) {
-                            Ok(()) => {
-                                if let RemoteInput::TabletDelta(delta) = input {
-                                    delta_packets += 1;
-                                    if delta_packets <= 5 || delta_packets % 100 == 0 {
-                                        crate::input_log::write(format_args!(
-                                            "UDP sent tablet-delta packets={delta_packets} seq={} dx={} dy={} target={}",
-                                            sequences.tablet, delta.dx, delta.dy, connected.target
-                                        ));
-                                    }
-                                }
-                                if let Some(relative) = pointer_mode {
-                                    crate::input_log::write(format_args!(
-                                        "UDP sent pointer-mode relative={relative} target={}",
-                                        connected.target
-                                    ));
-                                    release_pending = !relative;
-                                    if !relative {
-                                        sender_center_snap.store(false, Ordering::Release);
-                                    }
-                                }
-                            }
-                            Err(error) => {
-                                crate::input_log::write(format_args!(
-                                    "UDP HID send failed: {error}"
-                                ));
-                                sender = None;
-                                sender_center_snap.store(false, Ordering::Release);
-                            }
+                        if !relative {
+                            sender_center_snap.store(false, Ordering::Release);
                         }
-                    } else {
-                        crate::input_log::write(format_args!(
-                            "UDP input dropped: no resolved target"
-                        ));
+                    }
+                    if let Err(error) = send_input(&transport, &mut sequences, input) {
+                        crate::input_log::write(format_args!("SSH input not sent: {error}"));
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
@@ -396,66 +252,21 @@ mod tests {
     }
 
     #[test]
-    fn receiver_status_requires_a_reply_from_the_target() {
-        let target = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let sender = HidUdpSender::connect(target.local_addr().unwrap()).unwrap();
-        sender.socket.set_nonblocking(true).unwrap();
-        let snap = AtomicBool::new(false);
-        let mut pending = false;
-        assert!(!receive_control(&sender, &snap, &mut pending));
-        let mut reply = [0u8; 8];
-        reply[..4].copy_from_slice(CONTROL_MAGIC);
-        reply[4] = HID_UDP_VERSION;
-        reply[5] = 1;
-        reply[6..8].copy_from_slice(&HID_UDP_DEVICE_ID.to_le_bytes());
-        let dest = SocketAddr::from(([127, 0, 0, 1], sender.socket.local_addr().unwrap().port()));
-        target.send_to(&reply, dest).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !receive_control(&sender, &snap, &mut pending) {
-            assert!(Instant::now() < deadline);
-            thread::yield_now();
-        }
-        assert!(snap.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn captured_movement_reaches_a_real_udp_receiver() {
-        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-        receiver
-            .set_read_timeout(Some(Duration::from_secs(1)))
-            .unwrap();
-        let sender = HidUdpSender::connect(receiver.local_addr().unwrap()).unwrap();
+    fn captured_movement_encodes_for_the_shared_ssh_channel() {
         let mut seqs = HidUdpSeqs::new();
-        for (dx, dy) in [(11, -4), (9, -6)] {
-            send_input(
-                &sender,
-                &mut seqs,
-                RemoteInput::TabletDelta(TabletDeltaInput {
-                    buttons_down: 0,
-                    dx,
-                    dy,
-                    wheel: 0,
-                }),
-            )
-            .unwrap();
-            let mut bytes = [0; 64];
-            let count = receiver.recv(&mut bytes).unwrap();
-            assert_eq!(count, 32);
-            assert_eq!(&bytes[..4], b"THID");
-            assert_eq!(bytes[5], HID_UDP_KIND_TABLET);
-            assert_eq!(
-                u16::from_le_bytes(bytes[6..8].try_into().unwrap()),
-                INPUT_FLAG_RELATIVE
-            );
-            assert_eq!(
-                i32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-                i32::from(dx)
-            );
-            assert_eq!(
-                i32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-                i32::from(dy)
-            );
-        }
+        let bytes = encode_input(
+            &mut seqs,
+            RemoteInput::TabletDelta(TabletDeltaInput {
+                buttons_down: 7,
+                dx: 11,
+                dy: -4,
+                wheel: 0,
+            }),
+        );
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(&bytes[..4], b"THID");
+        assert_eq!(i32::from_le_bytes(bytes[16..20].try_into().unwrap()), 11);
+        assert_eq!(i32::from_le_bytes(bytes[20..24].try_into().unwrap()), -4);
     }
 
     #[test]
