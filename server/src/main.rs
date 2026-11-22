@@ -1,6 +1,6 @@
 use std::env;
 use std::io::{self, Read};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{
@@ -18,40 +18,47 @@ use trueos_rdp_protocol::{
 const SUBSCRIBER_TIMEOUT: Duration = Duration::from_secs(3);
 const USAGE: &str = "View-only Ubuntu window stream to TRUEOS (UDP; no remote control)\n\n\
 Usage: trueos-rdp-server --window <decimal-or-hex-X11-ID> [options]\n\
+       trueos-rdp-server --portal [options]\n\
        trueos-rdp-server --test-source [options]\n\n\
 Options:\n\
   --bind <IP:PORT>     UDP listener (default 0.0.0.0:43402)\n\
+  --peer <IP>          Accept subscriptions only from this source IP\n\
   --display <DISPLAY>  X11 display (default $DISPLAY)\n\
   --width <pixels>     Encoded width (default 1280, even, 64..1920)\n\
   --height <pixels>    Encoded height (default 720, even, 64..1080)\n\
   --fps <frames>      Frame rate (default 30, 1..60)\n\
+  --portal            Share a monitor or window through the desktop picker\n\
   --test-source       Stream an FFmpeg synthetic test pattern\n\
   --help              Show this help\n\n\
-Capture requires an Xorg session or an XWayland window. Native Wayland windows\n\
-are not supported in this first version. Encoding uses FFmpeg/libx264.\n";
+Portal capture uses PipeWire and GStreamer. X11 and test capture use FFmpeg/libx264.\n";
 
 #[derive(Debug)]
 struct Config {
     bind: SocketAddr,
+    peer: Option<IpAddr>,
     window: Option<u32>,
     display: Option<String>,
     width: u16,
     height: u16,
     fps: u16,
     test_source: bool,
+    portal: bool,
 }
 
 impl Config {
     fn parse(args: impl Iterator<Item = String>) -> Result<Option<Self>, String> {
         let mut config = Self {
             bind: ([0, 0, 0, 0], DEFAULT_PORT).into(),
+            peer: None,
             window: None,
             display: env::var("DISPLAY").ok(),
             width: 1280,
             height: 720,
             fps: 30,
             test_source: false,
+            portal: false,
         };
+        let mut bind_explicit = false;
         let mut args = args;
         while let Some(arg) = args.next() {
             if arg == "--help" || arg == "-h" {
@@ -61,11 +68,21 @@ impl Config {
                 config.test_source = true;
                 continue;
             }
+            if arg == "--portal" {
+                config.portal = true;
+                continue;
+            }
             let value = args
                 .next()
                 .ok_or_else(|| format!("{arg} requires a value"))?;
             match arg.as_str() {
-                "--bind" => config.bind = value.parse().map_err(|_| "invalid --bind IP:PORT")?,
+                "--bind" => {
+                    config.bind = value.parse().map_err(|_| "invalid --bind IP:PORT")?;
+                    bind_explicit = true;
+                }
+                "--peer" => {
+                    config.peer = Some(value.parse().map_err(|_| "invalid --peer IP")?);
+                }
                 "--window" => {
                     let value = if let Some(hex) = value
                         .strip_prefix("0x")
@@ -99,10 +116,34 @@ impl Config {
         {
             return Err("expected even dimensions in 64..1920 by 64..1080 and fps in 1..60".into());
         }
-        if config.test_source == config.window.is_some() {
-            return Err("choose exactly one of --window ID or --test-source".into());
+        if u8::from(config.test_source)
+            + u8::from(config.window.is_some())
+            + u8::from(config.portal)
+            != 1
+        {
+            return Err("choose exactly one of --portal, --window ID, or --test-source".into());
         }
-        if !config.test_source && config.display.as_ref().is_none_or(|s| s.is_empty()) {
+        if config.portal {
+            if !bind_explicit {
+                config.bind = ([127, 0, 0, 1], DEFAULT_PORT).into();
+            } else if !config.bind.ip().is_loopback() {
+                if config.bind.ip().is_unspecified() || config.bind.ip().is_multicast() {
+                    return Err("--portal requires a specific bind address".into());
+                }
+                if config.peer.is_none() {
+                    return Err("--portal with a LAN bind requires --peer IP".into());
+                }
+            }
+        }
+        if let Some(peer) = config.peer
+            && (peer.is_unspecified()
+                || peer.is_multicast()
+                || peer.is_ipv4() != config.bind.is_ipv4()
+                || peer.is_loopback() != config.bind.ip().is_loopback())
+        {
+            return Err("--peer must be a unicast IP compatible with --bind".into());
+        }
+        if config.window.is_some() && config.display.as_ref().is_none_or(|s| s.is_empty()) {
             return Err(
                 "--window requires DISPLAY or --display; run in the Ubuntu desktop session".into(),
             );
@@ -111,6 +152,18 @@ impl Config {
     }
 
     fn encoder_command(&self) -> Command {
+        if self.portal {
+            let mut command = Command::new("python3");
+            command
+                .args(["-c", include_str!("portal_capture.py")])
+                .arg(self.width.to_string())
+                .arg(self.height.to_string())
+                .arg(self.fps.to_string())
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            return command;
+        }
         let mut command = Command::new("ffmpeg");
         command.args(["-hide_banner", "-loglevel", "warning", "-nostdin"]);
         if self.test_source {
@@ -137,7 +190,7 @@ impl Config {
     }
 }
 
-/// FFmpeg emits AUD before each picture; delimit AUs across arbitrary pipe reads.
+/// Both encoders emit AUD before each picture; delimit AUs across pipe reads.
 #[derive(Default)]
 struct AccessUnits {
     bytes: Vec<u8>,
@@ -192,7 +245,7 @@ impl Encoder {
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| io::Error::other("FFmpeg stdout missing"))?;
+            .ok_or_else(|| io::Error::other("encoder stdout missing"))?;
         // Backpressure the encoder rather than silently losing reference frames.
         let (sender, units) = mpsc::sync_channel(2);
         thread::spawn(move || {
@@ -262,6 +315,8 @@ fn serve(config: Config) -> io::Result<()> {
         config.fps,
         if config.test_source {
             "synthetic".into()
+        } else if config.portal {
+            "desktop portal".into()
         } else {
             format!("X11 window 0x{:x}", config.window.unwrap())
         }
@@ -279,7 +334,10 @@ fn serve(config: Config) -> io::Result<()> {
             subscriber = None;
         }
         match socket.recv_from(&mut received) {
-            Ok((count, peer)) if &received[..count] == SUBSCRIBE_TOKEN => {
+            Ok((count, peer))
+                if &received[..count] == SUBSCRIBE_TOKEN
+                    && config.peer.is_none_or(|allowed| allowed == peer.ip()) =>
+            {
                 if subscriber.as_ref().is_none_or(|s| s.peer == peer) {
                     let sub = subscriber.get_or_insert_with(|| {
                         session = session.wrapping_add(1).max(1);
@@ -352,6 +410,15 @@ fn serve(config: Config) -> io::Result<()> {
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => {
                 let status = encoder.child.wait()?;
+                if config.portal {
+                    return if status.success() {
+                        Ok(())
+                    } else {
+                        Err(io::Error::other(format!(
+                            "desktop portal capture exited ({status})"
+                        )))
+                    };
+                }
                 return Err(io::Error::other(format!(
                     "FFmpeg exited ({status}); check window ID/display and ffmpeg/libx264 installation"
                 )));
@@ -408,6 +475,32 @@ mod tests {
             Config::parse(args.iter().map(|arg| arg.to_string()))
         }
         assert!(parse(&["--test-source"]).unwrap().unwrap().test_source);
+        let portal = parse(&["--portal"]).unwrap().unwrap();
+        assert!(portal.portal && portal.bind.ip().is_loopback());
+        assert!(parse(&["--portal", "--bind", "[::1]:43402"]).is_ok());
+        assert!(parse(&["--portal", "--bind", "0.0.0.0:43402"]).is_err());
+        assert!(parse(&["--portal", "--bind", "192.0.2.1:43402"]).is_err());
+        assert!(
+            parse(&[
+                "--portal",
+                "--bind",
+                "192.0.2.1:43402",
+                "--peer",
+                "192.0.2.2"
+            ])
+            .is_ok()
+        );
+        assert!(
+            parse(&[
+                "--portal",
+                "--bind",
+                "192.0.2.1:43402",
+                "--peer",
+                "127.0.0.1"
+            ])
+            .is_err()
+        );
+        assert!(parse(&["--portal", "--test-source"]).is_err());
         assert!(
             parse(&["--window", "0x123", "--display", ":0"])
                 .unwrap()

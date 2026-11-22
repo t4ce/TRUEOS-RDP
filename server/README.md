@@ -1,10 +1,10 @@
-# Ubuntu window server
+# Ubuntu ViewOnly server
 
-This is the first view-only Ubuntu → TRUEOS stream. A Rust server captures one
-chosen X11 window through FFmpeg, sends low-latency baseline H.264 over UDP
-43402, and the `rdp` Blueprint feeds TRUEOS's native iGPU video decoder/UI4
-video frame. It has no keyboard, mouse, clipboard, audio, or remote-control
-protocol. This is a TRUEOS video transport, not Microsoft RDP compatibility.
+The Rust server streams one Ubuntu monitor or window to the `rdp` Blueprint.
+On GNOME Wayland it uses the desktop sharing portal, PipeWire, and GStreamer.
+The X11 capture path uses FFmpeg. The viewer feeds baseline H.264 from UDP
+43402 into TRUEOS's native iGPU decoder and UI4 video frame. The protocol
+carries video only.
 
 ## Build and local verification
 
@@ -22,6 +22,40 @@ The smoke check uses a synthetic pattern and loopback UDP. It validates packet
 CRC/reassembly, decodes received pictures with FFprobe, and checks that a second
 subscriber cannot replace an active one. It needs no display or bare-metal rig.
 The independent Cargo workspace leaves the existing desktop RDP viewer alone.
+
+## Share a Wayland monitor or window on localhost
+
+Install the portal capture dependencies inside Ubuntu.
+
+```sh
+sudo apt install python3-gi gir1.2-gstreamer-1.0 gstreamer1.0-pipewire gstreamer1.0-plugins-base gstreamer1.0-plugins-ugly
+```
+
+Run the daemon in the logged-in GNOME session and choose the monitor or window
+in the sharing picker.
+
+```sh
+./target/release/trueos-rdp-server --portal
+```
+
+This mode binds to `127.0.0.1:43402` by default. Use the Blueprint's Linux
+receive probe with `--probe 5 127.0.0.1:43402` to verify the stream on the same
+host. Use GNOME's sharing indicator or Ctrl+C in the daemon terminal to stop
+capture.
+
+## Share a Wayland monitor or window with the TRUEOS rig
+
+On the current bring-up LAN the Ubuntu host is `192.168.178.111` and the
+TRUEOS rig is `192.168.178.94`.
+
+```sh
+./target/release/trueos-rdp-server --portal --bind 192.168.178.111:43402 --peer 192.168.178.94
+```
+
+Approve the source in the picker, then launch `rdp` on the rig. A LAN portal
+listener requires an explicit bind address and an allowed viewer IP. The
+source-IP filter limits subscription admission on this trusted LAN. UDP
+video is unauthenticated and unencrypted.
 
 ## Choose an Ubuntu window and stream it
 
@@ -53,11 +87,9 @@ If Ubuntu's firewall is enabled, permit UDP 43402 from the TRUEOS machine on
 your LAN. The transport is unauthenticated and unencrypted: use a trusted LAN
 or an existing VPN and avoid forwarding the UDP port onto the Internet.
 
-## Capture limits for this first version
+## X11 capture limits
 
-- Native Wayland window capture is not implemented. XWayland windows can work,
-  but an Xorg session is the straightforward first target. No PipeWire portal
-  integration is included yet.
+- With `--window`, use Xorg or select an XWayland window.
 - X11 capture follows the chosen window's pixels; visibility/occlusion depends
   on the X server/compositor. Keep the window visible and unminimized.
 - The source window size is fixed when FFmpeg opens it. Restart the server
