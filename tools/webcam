@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+webcam_repo=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$webcam_repo"
+exec cargo run --release --locked --manifest-path "$webcam_repo/tools/webcam-bridge/Cargo.toml"

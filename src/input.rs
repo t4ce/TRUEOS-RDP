@@ -1,4 +1,3 @@
-use std::io;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -57,14 +56,14 @@ pub struct KeyboardInput {
 }
 
 #[derive(Debug)]
-struct HidUdpSeqs {
+pub(crate) struct InputEncoder {
     keyboard: u32,
     tablet: u32,
     control: u32,
 }
 
-impl HidUdpSeqs {
-    fn new() -> Self {
+impl InputEncoder {
+    pub(crate) fn new() -> Self {
         Self {
             keyboard: 0,
             tablet: 0,
@@ -85,6 +84,52 @@ impl HidUdpSeqs {
     fn next_tablet(&mut self) -> u32 {
         self.tablet = self.tablet.wrapping_add(1);
         self.tablet
+    }
+
+    pub(crate) fn encode(&mut self, input: RemoteInput) -> Vec<u8> {
+        match input {
+            RemoteInput::Keyboard(input) => encode_hid_packet(
+                HID_UDP_KIND_KEYBOARD,
+                0,
+                self.next_keyboard(),
+                &[
+                    input.modifiers,
+                    0,
+                    input.keys[0],
+                    input.keys[1],
+                    input.keys[2],
+                    input.keys[3],
+                    input.keys[4],
+                    input.keys[5],
+                ],
+            ),
+            RemoteInput::TabletDelta(input) => encode_hid_packet(
+                HID_UDP_KIND_TABLET,
+                INPUT_FLAG_RELATIVE,
+                self.next_tablet(),
+                &encode_tablet_delta_payload(input),
+            ),
+            RemoteInput::Tablet(input) => {
+                let mut payload = Vec::with_capacity(16);
+                payload.extend_from_slice(&input.x_q16.to_le_bytes());
+                payload.extend_from_slice(&input.y_q16.to_le_bytes());
+                payload.extend_from_slice(&input.buttons_down.to_le_bytes());
+                payload.extend_from_slice(&input.wheel.to_le_bytes());
+                payload.extend_from_slice(&[0, 0]);
+                encode_hid_packet(
+                    HID_UDP_KIND_TABLET,
+                    input.flags,
+                    self.next_tablet(),
+                    &payload,
+                )
+            }
+            RemoteInput::SetPointerMode { relative } => encode_hid_packet(
+                HID_UDP_KIND_CONTROL,
+                pointer_mode_control_flags(relative),
+                self.next_control(),
+                &[],
+            ),
+        }
     }
 }
 
@@ -110,60 +155,6 @@ fn encode_hid_packet(kind: u8, flags: u16, seq: u32, payload: &[u8]) -> Vec<u8> 
     packet
 }
 
-fn send_input(
-    transport: &crate::ssh::SshTransport,
-    sequences: &mut HidUdpSeqs,
-    input: RemoteInput,
-) -> io::Result<()> {
-    transport.send_input(encode_input(sequences, input))
-}
-
-fn encode_input(sequences: &mut HidUdpSeqs, input: RemoteInput) -> Vec<u8> {
-    match input {
-        RemoteInput::Keyboard(input) => encode_hid_packet(
-            HID_UDP_KIND_KEYBOARD,
-            0,
-            sequences.next_keyboard(),
-            &[
-                input.modifiers,
-                0,
-                input.keys[0],
-                input.keys[1],
-                input.keys[2],
-                input.keys[3],
-                input.keys[4],
-                input.keys[5],
-            ],
-        ),
-        RemoteInput::TabletDelta(input) => encode_hid_packet(
-            HID_UDP_KIND_TABLET,
-            INPUT_FLAG_RELATIVE,
-            sequences.next_tablet(),
-            &encode_tablet_delta_payload(input),
-        ),
-        RemoteInput::Tablet(input) => {
-            let mut payload = Vec::with_capacity(16);
-            payload.extend_from_slice(&input.x_q16.to_le_bytes());
-            payload.extend_from_slice(&input.y_q16.to_le_bytes());
-            payload.extend_from_slice(&input.buttons_down.to_le_bytes());
-            payload.extend_from_slice(&input.wheel.to_le_bytes());
-            payload.extend_from_slice(&[0, 0]);
-            encode_hid_packet(
-                HID_UDP_KIND_TABLET,
-                input.flags,
-                sequences.next_tablet(),
-                &payload,
-            )
-        }
-        RemoteInput::SetPointerMode { relative } => encode_hid_packet(
-            HID_UDP_KIND_CONTROL,
-            pointer_mode_control_flags(relative),
-            sequences.next_control(),
-            &[],
-        ),
-    }
-}
-
 fn pointer_mode_control_flags(relative: bool) -> u16 {
     CONTROL_POINTER_MODE_VALID
         | if relative {
@@ -180,7 +171,7 @@ pub fn spawn_sender(
     let center_snap = Arc::new(AtomicBool::new(false));
     let sender_center_snap = center_snap.clone();
     thread::spawn(move || {
-        let mut sequences = HidUdpSeqs::new();
+        let mut encoder = InputEncoder::new();
         let mut generation = transport.generation();
         let mut last_control_poll = Instant::now() - CONTROL_POLL_INTERVAL;
         let mut local_pointer_mode = None;
@@ -189,7 +180,7 @@ pub fn spawn_sender(
                 generation = transport.generation();
                 // Never replay input accumulated for the previous target/session.
                 while input_rx.try_recv().is_ok() {}
-                sequences = HidUdpSeqs::new();
+                encoder = InputEncoder::new();
                 sender_center_snap.store(false, Ordering::Release);
             }
             for reply in transport.take_controls() {
@@ -212,7 +203,7 @@ pub fn spawn_sender(
                 let _ = transport.send_input(encode_hid_packet(
                     HID_UDP_KIND_CONTROL,
                     flags,
-                    sequences.next_control(),
+                    encoder.next_control(),
                     &[],
                 ));
             }
@@ -224,7 +215,7 @@ pub fn spawn_sender(
                             sender_center_snap.store(false, Ordering::Release);
                         }
                     }
-                    if let Err(error) = send_input(&transport, &mut sequences, input) {
+                    if let Err(error) = transport.send_input(encoder.encode(input)) {
                         crate::input_log::write(format_args!("SSH input not sent: {error}"));
                     }
                 }
@@ -242,27 +233,24 @@ mod tests {
 
     #[test]
     fn sender_counters_are_independent_and_restart_without_a_clock() {
-        let mut first = HidUdpSeqs::new();
+        let mut first = InputEncoder::new();
         assert_eq!(first.next_tablet(), 1);
         assert_eq!(first.next_tablet(), 2);
         assert_eq!(first.next_keyboard(), 1);
         assert_eq!(first.next_control(), 1);
-        let mut restarted = HidUdpSeqs::new();
+        let mut restarted = InputEncoder::new();
         assert_eq!(restarted.next_tablet(), 1);
     }
 
     #[test]
     fn captured_movement_encodes_for_the_shared_ssh_channel() {
-        let mut seqs = HidUdpSeqs::new();
-        let bytes = encode_input(
-            &mut seqs,
-            RemoteInput::TabletDelta(TabletDeltaInput {
-                buttons_down: 7,
-                dx: 11,
-                dy: -4,
-                wheel: 0,
-            }),
-        );
+        let mut encoder = InputEncoder::new();
+        let bytes = encoder.encode(RemoteInput::TabletDelta(TabletDeltaInput {
+            buttons_down: 7,
+            dx: 11,
+            dy: -4,
+            wheel: 0,
+        }));
         assert_eq!(bytes.len(), 32);
         assert_eq!(&bytes[..4], b"THID");
         assert_eq!(i32::from_le_bytes(bytes[16..20].try_into().unwrap()), 11);

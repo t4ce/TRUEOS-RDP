@@ -111,3 +111,27 @@ WGPU_BACKEND=gl ./target/release/trueos-rdp
 
 The terminal's `adapterlibgfx desktop selected` line identifies the selected
 backend and GPU. OpenGL uses the system EGL/GL driver; no browser is bundled.
+
+## Webcam backup control
+
+Run `./tools/webcam` from a terminal. It opens the [webcam page](tools/webcam.html)
+in your browser and prints its private local URL. The launcher uses your
+current user and the default rig at `192.168.178.94`. Set `TRUEOS_RDP_HOST` to
+`USER@HOST` if you need a different account or rig.
+
+1. Use your enrolled SSH key from disk or your SSH agent for automatic login.
+   The launcher uses your normal OpenSSH configuration.
+2. Enter your Cry authenticator code in the launcher's terminal if OpenSSH
+   prompts for it.
+
+For a new rig, verify and trust its host key with ordinary SSH first. **Control**
+is on by default once SSH connects. Focus the webcam preview to send input.
+Leaving the page or turning **Control** off releases held input. The browser
+still handles its reserved shortcuts. Press Ctrl+C in the terminal to stop the
+local bridge.
+
+On first use, click the monitor corners clockwise from the top left or drag
+the handles onto them. Select **Done** to save the four camera coordinates in a
+browser cookie. Mouse input maps to the calibrated screen. **Straighten view**
+perspective-corrects the camera image to the rig's display ratio. Open
+**Calibrate mouse** to adjust the corners in the raw preview.

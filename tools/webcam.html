@@ -1,0 +1,631 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Webcam</title>
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #camera { display: block; width: 100%; height: 100%; object-fit: contain; }
+  #warp-view, #shade, #corner-editor { position: fixed; inset: 0; }
+  #warp-view { background: #000; pointer-events: none; }
+  #warp-frame { position: absolute; overflow: hidden; }
+  #warped { display: block; transform-origin: 0 0; }
+  #shade { background: rgb(211 211 211 / 50%); pointer-events: none; }
+  #corner-editor { cursor: crosshair; touch-action: none; }
+  .corner {
+    position: absolute; transform: translate(-50%, -50%); width: 24px; height: 24px;
+    border: 2px solid white; border-radius: 50%; box-shadow: 0 0 0 1px #333;
+    padding: 0; background: #ddd; color: #111; font: 600 12px system-ui, sans-serif; cursor: grab;
+  }
+  .corner:active { cursor: grabbing; }
+  #controls {
+    position: fixed; right: 12px; bottom: 12px; z-index: 1; padding: 8px 12px; border-radius: 6px;
+    background: #181818; color: #fff; font: 14px system-ui, sans-serif;
+  }
+  #controls:not([hidden]) { display: flex; align-items: center; gap: 12px; }
+  #controls.calibrating {
+    right: 50%; transform: translateX(50%); width: max-content; max-width: calc(100% - 48px);
+    flex-wrap: wrap; justify-content: center;
+  }
+  #corner-hint { flex-basis: 100%; text-align: center; }
+  #controls label:not([hidden]) { display: flex; align-items: center; gap: 4px; }
+</style>
+<video id="camera" autoplay muted playsinline></video>
+<div id="warp-view" aria-hidden="true" hidden>
+  <div id="warp-frame"><video id="warped" autoplay muted playsinline></video></div>
+</div>
+<div id="shade" aria-hidden="true" hidden></div>
+<div id="corner-editor" role="group" aria-label="Monitor corners" hidden>
+  <button class="corner" type="button" aria-label="Top-left corner">1</button>
+  <button class="corner" type="button" aria-label="Top-right corner">2</button>
+  <button class="corner" type="button" aria-label="Bottom-right corner">3</button>
+  <button class="corner" type="button" aria-label="Bottom-left corner">4</button>
+</div>
+<aside id="controls" aria-label="Webcam control" hidden>
+  <span id="corner-hint" role="status" hidden></span>
+  <label title="Ctrl+Space turns control off"><input id="enabled" type="checkbox" checked> Control</label>
+  <span id="status" role="status"></span>
+  <button id="reconnect" type="button" hidden>Reconnect</button>
+  <label id="straighten-control"><input id="straighten" type="checkbox" checked> Straighten view</label>
+  <button id="calibrate" type="button">Calibrate mouse</button>
+  <button id="reset-corners" type="button" hidden>Reset corners</button>
+</aside>
+<script>
+  const video = document.querySelector('#camera');
+  let starting = false;
+
+  async function start() {
+    if (starting) return;
+    starting = true;
+    try {
+      if (!video.srcObject) {
+        video.srcObject = await navigator.mediaDevices.getUserMedia({
+          audio: false,
+          video: { width: { ideal: 1920 }, height: { ideal: 1080 } }
+        });
+      }
+      await video.play();
+    } catch (error) {
+      console.error('Webcam:', error);
+    } finally {
+      starting = false;
+    }
+  }
+
+  // A tap also retries if the browser requires a gesture or permission changed.
+  document.addEventListener('click', start);
+  window.addEventListener('pageshow', start);
+  window.addEventListener('pagehide', () => {
+    video.srcObject?.getTracks().forEach(track => track.stop());
+    video.srcObject = null;
+  });
+  start();
+
+  function setupControl() {
+    const controls = document.querySelector('#controls');
+    const enabled = document.querySelector('#enabled');
+    const status = document.querySelector('#status');
+    const reconnect = document.querySelector('#reconnect');
+    const inputUrl = new URL('input', location.href);
+    inputUrl.protocol = 'ws:';
+    let socket = null;
+    let ready = false;
+    const keys = new Set();
+    let buttons = 0;
+    let position = null;
+    let nextPosition = null;
+    let motionFrame = 0;
+    let wheelRemainder = 0;
+    const calibration = setupCalibration(video, clearPointer);
+
+    controls.hidden = false;
+    video.tabIndex = 0;
+    video.setAttribute('aria-label', 'Webcam. Ctrl+Space turns control off.');
+
+    function updateStatus() {
+      status.textContent = !enabled.checked ? 'Off' : ready ? 'Connected' :
+        socket ? 'Waiting for SSH' : 'Disconnected';
+      reconnect.hidden = !enabled.checked || socket !== null;
+    }
+
+    function connect() {
+      if (socket || !enabled.checked) return;
+      const connection = new WebSocket(inputUrl);
+      socket = connection;
+      updateStatus();
+      connection.addEventListener('message', event => {
+        if (socket !== connection) return;
+        if (event.data === 'disconnected') connection.close();
+        const dimensions = /^ready:(\d+):(\d+)$/.exec(event.data);
+        if (event.data === 'ready' || dimensions) {
+          if (dimensions) calibration.setDimensions(Number(dimensions[1]), Number(dimensions[2]));
+          ready = true;
+          updateStatus();
+        }
+      });
+      connection.addEventListener('close', () => {
+        if (socket !== connection) return;
+        socket = null;
+        ready = false;
+        resetInput();
+        updateStatus();
+      });
+    }
+
+    function send(report) {
+      if (!ready || socket?.readyState !== WebSocket.OPEN) return;
+      if (socket.bufferedAmount > 4096) {
+        socket.close();
+        return;
+      }
+      socket.send(report);
+    }
+
+    function clearMotion() {
+      if (motionFrame) cancelAnimationFrame(motionFrame);
+      motionFrame = 0;
+      nextPosition = null;
+    }
+
+    function resetInput() {
+      if (keys.size || buttons) send(Uint8Array.of(3));
+      keys.clear();
+      buttons = 0;
+      clearPointer();
+    }
+
+    function clearPointer() {
+      if (buttons) pointer(null, 0);
+      position = null;
+      wheelRemainder = 0;
+      clearMotion();
+    }
+
+    function ownsFocus() {
+      return enabled.checked && ready && !document.hidden && document.hasFocus() &&
+        document.activeElement === video;
+    }
+
+    function capturesInput(event) {
+      return event.isTrusted && ownsFocus();
+    }
+
+    function updateEnabled() {
+      if (enabled.checked) {
+        connect();
+        video.focus({ preventScroll: true });
+      } else {
+        resetInput();
+      }
+      updateStatus();
+    }
+
+    function keyboard(event, down) {
+      if (!capturesInput(event)) return;
+      if (down && event.code === 'Space' && event.ctrlKey) {
+        event.preventDefault();
+        enabled.checked = false;
+        updateEnabled();
+        return;
+      }
+      const usage = keyUsage(event.code);
+      if (!usage) return;
+      event.preventDefault();
+      if (down === keys.has(usage)) return;
+      if (down) keys.add(usage);
+      else keys.delete(usage);
+      const report = new Uint8Array(8);
+      report[0] = 1;
+      let index = 2;
+      for (const key of keys) {
+        if (key >= 0xe0) report[1] |= 1 << (key - 0xe0);
+        else if (index < report.length) report[index++] = key;
+      }
+      send(report);
+    }
+
+    function pointer(point, nextButtons, wheel = 0) {
+      const target = point ?? position;
+      if (!target) return;
+      if (target.x === position?.x && target.y === position?.y && !wheel && buttons === nextButtons) return;
+      position = target;
+      buttons = nextButtons;
+      const report = new DataView(new ArrayBuffer(8));
+      report.setUint8(0, 4);
+      report.setUint8(1, buttons);
+      report.setUint16(2, target.x, true);
+      report.setUint16(4, target.y, true);
+      report.setInt16(6, wheel, true);
+      send(report.buffer);
+    }
+
+    enabled.addEventListener('change', updateEnabled);
+    reconnect.addEventListener('click', updateEnabled);
+    video.addEventListener('keydown', event => keyboard(event, true));
+    video.addEventListener('keyup', event => keyboard(event, false));
+    video.addEventListener('blur', resetInput);
+    window.addEventListener('blur', resetInput);
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden) resetInput();
+    });
+    window.addEventListener('pageshow', event => {
+      if (event.persisted) connect();
+    });
+    window.addEventListener('pagehide', () => {
+      resetInput();
+      ready = false;
+      socket?.close();
+      socket = null;
+    });
+
+    const buttonMask = [1, 4, 2, 8, 16];
+    video.addEventListener('mousemove', event => {
+      if (!capturesInput(event) || calibration.editing) return;
+      nextPosition = calibration.map(event);
+      const heldButtons = buttons & event.buttons;
+      if (buttons !== heldButtons) {
+        pointer(nextPosition, heldButtons);
+        clearMotion();
+        return;
+      }
+      if (!nextPosition) return;
+      if (motionFrame) return;
+      motionFrame = requestAnimationFrame(() => {
+        if (ownsFocus() && !calibration.editing) pointer(nextPosition, buttons);
+        clearMotion();
+      });
+    });
+    video.addEventListener('mouseleave', event => {
+      if (capturesInput(event)) pointer(nextPosition, buttons);
+      clearMotion();
+    });
+    video.addEventListener('mousedown', event => {
+      const point = calibration.map(event);
+      if (!point || calibration.editing) return;
+      if (event.isTrusted && enabled.checked) video.focus({ preventScroll: true });
+      if (!capturesInput(event)) return;
+      event.preventDefault();
+      clearMotion();
+      pointer(point, buttons | (buttonMask[event.button] ?? 0));
+    });
+    window.addEventListener('mouseup', event => {
+      if (!capturesInput(event)) return;
+      const released = buttons & ~event.buttons;
+      if (!released) return;
+      clearMotion();
+      pointer(event.target === video ? calibration.map(event) : null, buttons & ~released);
+    });
+    video.addEventListener('contextmenu', event => {
+      if (capturesInput(event) && calibration.map(event)) event.preventDefault();
+    });
+    video.addEventListener('auxclick', event => {
+      if (capturesInput(event) && calibration.map(event)) event.preventDefault();
+    });
+    video.addEventListener('wheel', event => {
+      if (!capturesInput(event) || calibration.editing) return;
+      const point = calibration.map(event);
+      if (!point) return;
+      event.preventDefault();
+      const scale = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL ? 32 : 1;
+      const delta = Math.abs(event.deltaY) >= Math.abs(event.deltaX) ? event.deltaY : event.deltaX;
+      wheelRemainder -= delta / scale;
+      const ticks = toI16(Math.trunc(wheelRemainder));
+      wheelRemainder -= ticks;
+      if (!ticks) return;
+      clearMotion();
+      pointer(point, buttons, ticks);
+    }, { passive: false });
+
+    connect();
+    if (document.activeElement === document.body) video.focus({ preventScroll: true });
+  }
+
+  function setupCalibration(video, releaseMouse) {
+    const controls = document.querySelector('#controls');
+    const editor = document.querySelector('#corner-editor');
+    const handles = [...editor.querySelectorAll('.corner')];
+    const shade = document.querySelector('#shade');
+    const hint = document.querySelector('#corner-hint');
+    const calibrate = document.querySelector('#calibrate');
+    const reset = document.querySelector('#reset-corners');
+    const straighten = document.querySelector('#straighten');
+    const straightenControl = document.querySelector('#straighten-control');
+    const warpView = document.querySelector('#warp-view');
+    const warpFrame = document.querySelector('#warp-frame');
+    const warped = document.querySelector('#warped');
+    const names = ['top-left', 'top-right', 'bottom-right', 'bottom-left'];
+    const saved = readCorners();
+    let corners = saved ?? defaultCorners();
+    let transform = monitorTransform(corners);
+    let draft = saved ? null : corners;
+    let picked = [];
+    let dragging = null;
+    let source = null;
+    let output = null;
+    let monitorAspect = null;
+
+    function showCorners() {
+      const viewport = video.getBoundingClientRect();
+      source = video.videoWidth && video.videoHeight
+        ? fitRect(viewport, video.videoWidth / video.videoHeight) : null;
+      output = !draft && source && straighten.checked
+        ? fitRect(viewport, monitorAspect ?? quadAspect(corners, source)) : null;
+      warpView.hidden = !output;
+      if (output) {
+        Object.assign(warpFrame.style, {
+          left: `${output.left}px`, top: `${output.top}px`,
+          width: `${output.width}px`, height: `${output.height}px`,
+        });
+        Object.assign(warped.style, {
+          width: `${source.width}px`, height: `${source.height}px`,
+          transform: warpMatrix(transform, source, output),
+        });
+        if (warped.srcObject !== video.srcObject) warped.srcObject = video.srcObject;
+      } else if (warped.srcObject) {
+        warped.srcObject = null;
+      }
+
+      const display = draft ?? corners;
+      const candidate = display.map((point, index) => picked[index] ?? point);
+      const outline = output ? defaultCorners(0) : monitorTransform(candidate) ? candidate : display;
+      const bounds = output ?? source ?? viewport;
+      const toCss = point => {
+        const x = bounds.left + point.x * bounds.width;
+        const y = bounds.top + point.y * bounds.height;
+        return `${x}px ${y}px`;
+      };
+      shade.style.clipPath = `polygon(evenodd, 0 0, 100% 0, 100% 100%, 0 100%, 0 0, ${
+        outline.map(toCss).join(', ')}, ${toCss(outline[0])})`;
+      if (draft) {
+        handles.forEach((handle, index) => {
+          const [left, top] = toCss(candidate[index]).split(' ');
+          Object.assign(handle.style, { left, top });
+        });
+      }
+    }
+
+    function pickNext() {
+      hint.textContent = picked.length
+        ? `Click the ${names[picked.length]} corner.`
+        : 'Click the top-left monitor corner to start, or drag the handles.';
+    }
+
+    function showEditor() {
+      const editing = Boolean(draft);
+      shade.hidden = false;
+      controls.classList.toggle('calibrating', editing);
+      editor.hidden = hint.hidden = reset.hidden = !editing;
+      straightenControl.hidden = editing;
+      calibrate.textContent = editing ? 'Done' : 'Calibrate mouse';
+      if (editing) pickNext();
+      showCorners();
+    }
+
+    function moveCorner(index, point) {
+      const next = draft.slice();
+      next[index] = constrainCorner(point, index);
+      if (!monitorTransform(next)) return;
+      picked = [];
+      draft = next;
+      hint.textContent = 'Drag the handles to fit the monitor, then click Done.';
+      showCorners();
+    }
+
+    handles.forEach((handle, index) => {
+      handle.addEventListener('pointerdown', event => {
+        if (!event.isTrusted || !event.isPrimary || event.button !== 0 || !source) return;
+        dragging = { id: event.pointerId, index };
+        handle.setPointerCapture(event.pointerId);
+      });
+      handle.addEventListener('pointermove', event => {
+        if (source && dragging?.id === event.pointerId && dragging.index === index) {
+          moveCorner(index, pointIn(source, event));
+        }
+      });
+      handle.addEventListener('lostpointercapture', () => { dragging = null; });
+    });
+
+    editor.addEventListener('click', event => {
+      if (!event.isTrusted || event.target !== editor || !source) return;
+      const point = pointIn(source, event);
+      const index = picked.length;
+      if (!cornerAllowed(point, index)) {
+        hint.textContent = `Choose the ${names[index]} corner in its quadrant, outside the center.`;
+        return;
+      }
+      picked.push(point);
+      if (picked.length === 4) {
+        if (monitorTransform(picked)) {
+          draft = picked;
+          hint.textContent = 'Drag any corner to fine-tune, then click Done.';
+        } else {
+          hint.textContent = 'The corners must form a convex quad. Start again at the top left.';
+        }
+        picked = [];
+      } else {
+        pickNext();
+      }
+      showCorners();
+    });
+
+    calibrate.addEventListener('click', () => {
+      releaseMouse();
+      if (draft) {
+        if (picked.length) {
+          hint.textContent = `Click the ${names[picked.length]} corner, or reset the selection.`;
+          return;
+        }
+        corners = draft;
+        transform = monitorTransform(corners);
+        saveCorners(corners);
+        draft = null;
+        video.focus({ preventScroll: true });
+      } else {
+        draft = corners;
+      }
+      showEditor();
+    });
+    reset.addEventListener('click', () => {
+      draft = defaultCorners();
+      picked = [];
+      showEditor();
+    });
+    straighten.addEventListener('change', () => {
+      releaseMouse();
+      showCorners();
+      video.focus({ preventScroll: true });
+    });
+    window.addEventListener('resize', showCorners);
+    video.addEventListener('resize', showCorners);
+    showEditor();
+
+    return {
+      get editing() { return draft !== null; },
+      setDimensions(width, height) {
+        if (!width || !height) return;
+        monitorAspect = width / height;
+        showCorners();
+      },
+      map(event) {
+        if (draft || !source) return null;
+        const point = pointIn(output ?? source, event);
+        const mapped = output ? point : mapPoint(transform, point);
+        if (!mapped || ![mapped.x, mapped.y].every(n => n >= -1e-7 && n <= 1 + 1e-7)) return null;
+        const quantize = n => Math.round(clamp(n, 0, 1) * 65535);
+        return { x: quantize(mapped.x), y: quantize(mapped.y) };
+      },
+    };
+  }
+
+  function fitRect(bounds, aspect) {
+    const width = Math.min(bounds.width, bounds.height * aspect);
+    const height = width / aspect;
+    return {
+      left: bounds.left + (bounds.width - width) / 2,
+      top: bounds.top + (bounds.height - height) / 2,
+      width, height,
+    };
+  }
+
+  function pointIn(bounds, event) {
+    return { x: (event.clientX - bounds.left) / bounds.width, y: (event.clientY - bounds.top) / bounds.height };
+  }
+
+  function defaultCorners(inset = 0.25) {
+    return [
+      { x: inset, y: inset }, { x: 1 - inset, y: inset },
+      { x: 1 - inset, y: 1 - inset }, { x: inset, y: 1 - inset },
+    ];
+  }
+
+  function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
+  }
+
+  function constrainCorner(point, index) {
+    const right = index === 1 || index === 2;
+    const bottom = index >= 2;
+    let x = clamp(point.x, right ? 0.5 : 0, right ? 1 : 0.5);
+    let y = clamp(point.y, bottom ? 0.5 : 0, bottom ? 1 : 0.5);
+    if (x > 0.25 && x < 0.75 && y > 0.25 && y < 0.75) {
+      const edgeX = right ? 0.75 : 0.25;
+      const edgeY = bottom ? 0.75 : 0.25;
+      if (Math.abs(x - edgeX) < Math.abs(y - edgeY)) x = edgeX;
+      else y = edgeY;
+    }
+    return { x, y };
+  }
+
+  function cornerAllowed(point, index) {
+    const limited = constrainCorner(point, index);
+    return point.x === limited.x && point.y === limited.y;
+  }
+
+  const cornerCookie = 'trueos_webcam_corners';
+
+  function readCorners() {
+    try {
+      const prefix = `${cornerCookie}=`;
+      const cookie = document.cookie.split('; ').find(value => value.startsWith(prefix));
+      if (!cookie) return null;
+      const values = JSON.parse(decodeURIComponent(cookie.slice(prefix.length)));
+      const corners = values.map(([x, y]) => ({ x, y }));
+      return corners.length === 4 && corners.every(cornerAllowed) && monitorTransform(corners) ? corners : null;
+    } catch {
+      return null;
+    }
+  }
+
+  function saveCorners(corners) {
+    const values = encodeURIComponent(JSON.stringify(corners.map(({ x, y }) => [x, y])));
+    document.cookie = `${cornerCookie}=${values}; Path=/session/; Max-Age=31536000; SameSite=Strict`;
+  }
+
+  function monitorTransform(corners) {
+    for (let i = 0; i < 4; i++) {
+      const a = corners[i];
+      const b = corners[(i + 1) % 4];
+      const c = corners[(i + 2) % 4];
+      const turn = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x);
+      if (turn <= 1e-5) return null;
+    }
+    const [tl, tr, br, bl] = corners;
+    const dx1 = tr.x - br.x, dx2 = bl.x - br.x;
+    const dy1 = tr.y - br.y, dy2 = bl.y - br.y;
+    const dx3 = tl.x - tr.x + br.x - bl.x;
+    const dy3 = tl.y - tr.y + br.y - bl.y;
+    const det = dx1 * dy2 - dx2 * dy1;
+    const g = (dx3 * dy2 - dx2 * dy3) / det;
+    const h = (dx1 * dy3 - dx3 * dy1) / det;
+    const weights = [1, 1 + g, 1 + h, 1 + g + h];
+    if (Math.min(...weights) <= Math.max(...weights) * 1e-3) return null;
+
+    // Invert the unit-square-to-camera homography for both pointer and video.
+    const a = tr.x * (1 + g) - tl.x, b = bl.x * (1 + h) - tl.x, c = tl.x;
+    const d = tr.y * (1 + g) - tl.y, e = bl.y * (1 + h) - tl.y, f = tl.y;
+    const inverse = [
+      e - f * h, c * h - b, b * f - c * e,
+      f * g - d, a - c * g, c * d - a * f,
+      d * h - e * g, b * g - a * h, a * e - b * d,
+    ];
+    const determinant = a * inverse[0] + b * inverse[3] + c * inverse[6];
+    if (!Number.isFinite(determinant) || Math.abs(determinant) < 1e-10) return null;
+    return inverse.map(value => value / determinant);
+  }
+
+  function mapPoint(matrix, { x, y }) {
+    const [a, b, c, d, e, f, g, h, i] = matrix;
+    const w = g * x + h * y + i;
+    if (w <= 1e-10) return null;
+    return { x: (a * x + b * y + c) / w, y: (d * x + e * y + f) / w };
+  }
+
+  function warpMatrix(matrix, source, output) {
+    const [a, b, c, d, e, f, g, h, i] = matrix;
+    return `matrix3d(${[
+      a * output.width / source.width, d * output.height / source.width, 0, g / source.width,
+      b * output.width / source.height, e * output.height / source.height, 0, h / source.height,
+      0, 0, 1, 0,
+      c * output.width, f * output.height, 0, i,
+    ].join(',')})`;
+  }
+
+  function quadAspect([tl, tr, br, bl], source) {
+    const edge = (a, b) => Math.hypot((b.x - a.x) * source.width, (b.y - a.y) * source.height);
+    return (edge(tl, tr) + edge(bl, br)) / (edge(tl, bl) + edge(tr, br));
+  }
+
+  function toI16(value) {
+    return Math.max(-32768, Math.min(32767, Math.round(value)));
+  }
+
+  function keyUsage(code) {
+    if (/^Key[A-Z]$/.test(code)) return 0x04 + code.charCodeAt(3) - 65;
+    if (/^Digit[0-9]$/.test(code)) return 0x1e + (Number(code[5]) + 9) % 10;
+    if (/^Numpad[0-9]$/.test(code)) return 0x59 + (Number(code[6]) + 9) % 10;
+    if (/^F(?:[1-9]|1[0-9]|2[0-4])$/.test(code)) {
+      const number = Number(code.slice(1));
+      return number <= 12 ? 0x39 + number : 0x5b + number;
+    }
+    return keyUsages.get(code);
+  }
+
+  const keyUsages = new Map(Object.entries({
+    Enter: 0x28, Escape: 0x29, Backspace: 0x2a, Tab: 0x2b, Space: 0x2c,
+    Minus: 0x2d, Equal: 0x2e, BracketLeft: 0x2f, BracketRight: 0x30, Backslash: 0x31,
+    Semicolon: 0x33, Quote: 0x34, Backquote: 0x35, Comma: 0x36, Period: 0x37, Slash: 0x38,
+    CapsLock: 0x39, PrintScreen: 0x46, ScrollLock: 0x47, Pause: 0x48, Insert: 0x49,
+    Home: 0x4a, PageUp: 0x4b, Delete: 0x4c, End: 0x4d, PageDown: 0x4e,
+    ArrowRight: 0x4f, ArrowLeft: 0x50, ArrowDown: 0x51, ArrowUp: 0x52, NumLock: 0x53,
+    NumpadDivide: 0x54, NumpadMultiply: 0x55, NumpadSubtract: 0x56, NumpadAdd: 0x57,
+    NumpadEnter: 0x58, NumpadDecimal: 0x63, IntlBackslash: 0x64, ContextMenu: 0x65,
+    NumpadEqual: 0x67, ControlLeft: 0xe0, ShiftLeft: 0xe1, AltLeft: 0xe2, MetaLeft: 0xe3,
+    ControlRight: 0xe4, ShiftRight: 0xe5, AltRight: 0xe6, MetaRight: 0xe7,
+  }));
+
+  if (location.protocol === 'http:' && location.hostname === '127.0.0.1' &&
+      /^\/session\/[^/]+\/$/.test(location.pathname)) {
+    setupControl();
+  }
+</script>
+</html>

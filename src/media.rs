@@ -600,7 +600,7 @@ fn receive_ssh_media(
     let mut session: Option<(u32, Reassembler)> = None;
     for event in receiver {
         match event {
-            crate::ssh::MediaEvent::Connected => {
+            crate::ssh::MediaEvent::Connected { .. } => {
                 session = None;
                 if let Ok(mut current) = status.lock() {
                     current.last_error = None;
